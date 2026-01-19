@@ -1,5 +1,9 @@
 # sqlite-zstd
 
+[![CI](https://github.com/brianmacy/sqlite-zstd/workflows/CI/badge.svg)](https://github.com/brianmacy/sqlite-zstd/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Rust Edition](https://img.shields.io/badge/rust-edition%202024-orange.svg)](https://doc.rust-lang.org/edition-guide/)
+
 SQLite extension for seamless TEXT field compression using Zstandard (zstd).
 
 ## Installation

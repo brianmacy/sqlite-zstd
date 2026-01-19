@@ -261,9 +261,7 @@ fn zstd_enable_impl(
         .map_err(|e| format!("failed to begin transaction: {}", e))?;
 
     let result = (|| -> std::result::Result<String, String> {
-        // Register the virtual table module (idempotent - safe to call multiple times)
-        vtab::register_module(conn)
-            .map_err(|e| format!("failed to register zstd module: {}", e))?;
+        // Note: vtab module is registered in register_functions(), called during initialization
 
         // Rename original table to underlying table
         conn.execute(
@@ -643,6 +641,11 @@ fn zstd_stats_impl(conn: &Connection, table: &str) -> std::result::Result<String
 /// Returns error if function registration fails (rare - usually indicates
 /// SQLite version incompatibility or memory issues).
 pub fn register_functions(conn: &Connection) -> Result<()> {
+    // Register virtual table module FIRST
+    // This must happen during initialization so the module is available
+    // for any connection that might call zstd_enable()
+    vtab::register_module(conn)?;
+
     // zstd_compress(text) and zstd_compress(text, level) - raw, no marker
     conn.create_scalar_function(
         "zstd_compress",

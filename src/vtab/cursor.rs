@@ -1,13 +1,13 @@
 //! Cursor implementation for zstd virtual table.
 
-use rusqlite::ffi;
-use rusqlite::vtab::{sqlite3_vtab_cursor, Context, VTabCursor};
 use rusqlite::Result;
+use rusqlite::ffi;
+use rusqlite::vtab::{Context, VTabCursor, sqlite3_vtab_cursor};
 use std::marker::PhantomData;
 use std::os::raw::c_int;
 
-use crate::compression::decompress_with_marker;
 use super::zstd_vtab::ZstdVTab;
+use crate::compression::decompress_with_marker;
 
 /// Cursor for iterating through zstd virtual table rows
 #[repr(C)]

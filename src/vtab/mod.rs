@@ -9,8 +9,8 @@ pub mod zstd_vtab;
 
 // Public API exports (used by lib.rs and potentially external code)
 #[allow(unused_imports)]
-pub use conflict::{get_conflict_mode, ConflictMode};
+pub use conflict::{ConflictMode, get_conflict_mode};
 #[allow(unused_imports)]
 pub use cursor::ZstdCursor;
 #[allow(unused_imports)]
-pub use zstd_vtab::{register_module, VTabConfig, ZstdVTab};
+pub use zstd_vtab::{VTabConfig, ZstdVTab, register_module};

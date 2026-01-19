@@ -3,12 +3,12 @@
 use rusqlite::ffi;
 use rusqlite::types::{Value, ValueRef};
 use rusqlite::vtab::{
-    sqlite3_vtab, update_module, CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection, Values,
+    CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection, Values, sqlite3_vtab, update_module,
 };
 use rusqlite::{Connection, Result};
 
-use super::conflict::{get_conflict_mode, ConflictMode};
-use crate::compression::{compress_with_marker, DEFAULT_COMPRESSION_LEVEL};
+use super::conflict::{ConflictMode, get_conflict_mode};
+use crate::compression::{DEFAULT_COMPRESSION_LEVEL, compress_with_marker};
 
 /// Configuration for virtual table creation (reserved for future use)
 #[derive(Debug)]

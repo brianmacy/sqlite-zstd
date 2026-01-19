@@ -212,6 +212,44 @@ The virtual table:
 
 This approach uses standard SQL types and works with all ORMs and database tools.
 
+## Performance
+
+See [BENCHMARKS.md](BENCHMARKS.md) for detailed performance measurements.
+
+**Highlights:**
+- **Compression**: Up to 3.5 GiB/s throughput
+- **Decompression**: Up to 4.1 GiB/s throughput
+- **INSERT**: 333K rows/second with compression
+- **Filtered SELECT**: 333K queries/second (WHERE clause optimization)
+- **Space savings**: 60-99% depending on data type
+
+## Examples
+
+Run the included examples to see the extension in action:
+
+```bash
+# Basic usage walkthrough
+cargo run --example basic_usage
+
+# ON CONFLICT demonstrations
+cargo run --example on_conflict
+```
+
+## Testing with SQLite CLI
+
+Build the loadable extension and test with real SQLite:
+
+```bash
+# Build release extension
+cargo build --release --features loadable_extension
+
+# Test with Homebrew SQLite (macOS)
+/opt/homebrew/opt/sqlite/bin/sqlite3 :memory: < test_extension.sql
+
+# Or use interactively
+/opt/homebrew/opt/sqlite/bin/sqlite3 test.db
+```
+
 ## License
 
 Apache License 2.0

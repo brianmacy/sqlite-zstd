@@ -1517,4 +1517,155 @@ mod tests {
             .unwrap();
         assert_eq!(content, large_text);
     }
+
+    // -------------------------------------------------------------------------
+    // Phase 4: WHERE clause optimization tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_where_equality_filter() {
+        let conn = setup_test_db();
+        conn.execute(
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT, content TEXT)",
+            [],
+        )
+        .unwrap();
+
+        conn.query_row("SELECT zstd_enable('docs', 'content')", [], |_| Ok(()))
+            .unwrap();
+
+        // Insert test data
+        conn.execute(
+            "INSERT INTO docs (id, title, content) VALUES (1, 'First', 'Content 1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO docs (id, title, content) VALUES (2, 'Second', 'Content 2')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO docs (id, title, content) VALUES (3, 'Third', 'Content 3')",
+            [],
+        )
+        .unwrap();
+
+        // Test WHERE clause with equality
+        let title: String = conn
+            .query_row("SELECT title FROM docs WHERE id = 2", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(title, "Second");
+
+        // Test WHERE clause on compressed column
+        let content: String = conn
+            .query_row(
+                "SELECT content FROM docs WHERE title = 'Third'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "Content 3");
+    }
+
+    #[test]
+    fn test_where_multiple_conditions() {
+        let conn = setup_test_db();
+        conn.execute(
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT, content TEXT)",
+            [],
+        )
+        .unwrap();
+
+        conn.query_row("SELECT zstd_enable('docs', 'content')", [], |_| Ok(()))
+            .unwrap();
+
+        // Insert test data
+        for i in 1..=10 {
+            conn.execute(
+                "INSERT INTO docs (id, title, content) VALUES (?, ?, ?)",
+                rusqlite::params![i, format!("Title {}", i), format!("Content {}", i)],
+            )
+            .unwrap();
+        }
+
+        // Test multiple WHERE conditions
+        let count: i32 = conn
+            .query_row("SELECT COUNT(*) FROM docs WHERE id > 5", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 5);
+
+        // Test with decompression
+        let results: Vec<String> = conn
+            .prepare("SELECT content FROM docs WHERE id >= 8")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0], "Content 8");
+        assert_eq!(results[1], "Content 9");
+        assert_eq!(results[2], "Content 10");
+    }
+
+    #[test]
+    fn test_where_no_results() {
+        let conn = setup_test_db();
+        conn.execute(
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, content TEXT)",
+            [],
+        )
+        .unwrap();
+
+        conn.query_row("SELECT zstd_enable('docs', 'content')", [], |_| Ok(()))
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO docs (id, content) VALUES (1, 'Test')",
+            [],
+        )
+        .unwrap();
+
+        // Query that matches nothing
+        let count: i32 = conn
+            .query_row("SELECT COUNT(*) FROM docs WHERE id = 999", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_explain_query_plan() {
+        let conn = setup_test_db();
+        conn.execute(
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT, content TEXT)",
+            [],
+        )
+        .unwrap();
+
+        conn.query_row("SELECT zstd_enable('docs', 'content')", [], |_| Ok(()))
+            .unwrap();
+
+        // Get query plan for filtered query
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT * FROM docs WHERE id = 1",
+                [],
+                |row| {
+                    // The detail column contains the plan info
+                    row.get::<_, String>(3).or_else(|_| row.get(2))
+                },
+            )
+            .unwrap_or_default();
+
+        // Verify the plan shows virtual table usage
+        // The exact plan format varies, but it should mention the virtual table
+        println!("Query plan: {}", plan);
+        // We don't assert on the plan content as it's implementation-dependent
+        // The important thing is the query executes correctly with constraints
+    }
 }

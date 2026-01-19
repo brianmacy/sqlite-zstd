@@ -103,8 +103,55 @@ unsafe impl<'vtab> VTab<'vtab> for ZstdVTab {
         Ok((schema, vtab))
     }
 
-    fn best_index(&self, _info: &mut IndexInfo) -> Result<()> {
-        // Basic implementation - no optimization yet (Phase 4)
+    fn best_index(&self, info: &mut IndexInfo) -> Result<()> {
+        // Handle WHERE clause constraints for query optimization
+        // We encode which constraints we can use in idx_num as a bitmask
+        let mut idx_num = 0;
+        let mut argv_index = 1;
+
+        for (constraint, mut usage) in info.constraints_and_usages() {
+            if !constraint.is_usable() {
+                continue;
+            }
+
+            // We can handle equality and range constraints
+            match constraint.operator() {
+                rusqlite::vtab::IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_EQ => {
+                    // Equality constraint: col = value
+                    usage.set_argv_index(argv_index);
+                    usage.set_omit(true); // SQLite can skip re-checking
+                    idx_num |= 1 << constraint.column();
+                    argv_index += 1;
+                }
+                rusqlite::vtab::IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_GT
+                | rusqlite::vtab::IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_GE
+                | rusqlite::vtab::IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_LT
+                | rusqlite::vtab::IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_LE => {
+                    // Range constraints: col > value, col >= value, etc.
+                    usage.set_argv_index(argv_index);
+                    // Don't omit - SQLite should re-check these
+                    idx_num |= 1 << (constraint.column() + 16); // Use upper 16 bits for ranges
+                    argv_index += 1;
+                }
+                _ => {
+                    // Other constraints (LIKE, etc.) - let SQLite handle them
+                }
+            }
+        }
+
+        info.set_idx_num(idx_num);
+
+        // Estimate cost based on constraints
+        if idx_num > 0 {
+            // With constraints, we expect fewer rows
+            info.set_estimated_cost(10.0);
+            info.set_estimated_rows(100);
+        } else {
+            // Full table scan
+            info.set_estimated_cost(1000.0);
+            info.set_estimated_rows(10000);
+        }
+
         Ok(())
     }
 

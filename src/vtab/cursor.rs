@@ -47,9 +47,9 @@ impl Drop for ZstdCursor<'_> {
 unsafe impl VTabCursor for ZstdCursor<'_> {
     fn filter(
         &mut self,
-        _idx_num: c_int,
+        idx_num: c_int,
         _idx_str: Option<&str>,
-        _args: &rusqlite::vtab::Values<'_>,
+        args: &rusqlite::vtab::Values<'_>,
     ) -> Result<()> {
         // Clean up any existing statement
         if let Some(stmt) = self.stmt.take() {
@@ -58,8 +58,7 @@ unsafe impl VTabCursor for ZstdCursor<'_> {
             }
         }
 
-        // Build SELECT query for full table scan
-        // SELECT rowid, col1, col2, ... FROM underlying_table
+        // Build SELECT query with optional WHERE clause
         let col_list = std::iter::once("rowid".to_string())
             .chain(
                 self.vtab
@@ -70,10 +69,41 @@ unsafe impl VTabCursor for ZstdCursor<'_> {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let sql = format!(
-            "SELECT {} FROM \"{}\"",
-            col_list, self.vtab.underlying_table
-        );
+        // Build WHERE clause based on idx_num bitmask
+        let mut where_clauses = Vec::new();
+        let mut bind_values = Vec::new();
+
+        if idx_num > 0 {
+            let mut arg_idx = 0;
+
+            // Check for equality constraints (lower 16 bits)
+            for (col_idx, (col_name, _)) in self.vtab.all_columns.iter().enumerate() {
+                if (idx_num & (1 << col_idx)) != 0 {
+                    // This column has an equality constraint
+                    where_clauses.push(format!("\"{}\" = ?", col_name));
+                    if let Ok(val) = args.get::<rusqlite::types::Value>(arg_idx) {
+                        bind_values.push(val);
+                    }
+                    arg_idx += 1;
+                }
+            }
+
+            // Range constraints would be in upper 16 bits (future enhancement)
+        }
+
+        let sql = if where_clauses.is_empty() {
+            format!(
+                "SELECT {} FROM \"{}\"",
+                col_list, self.vtab.underlying_table
+            )
+        } else {
+            format!(
+                "SELECT {} FROM \"{}\" WHERE {}",
+                col_list,
+                self.vtab.underlying_table,
+                where_clauses.join(" AND ")
+            )
+        };
 
         // Prepare statement using raw SQLite API
         let mut stmt_ptr: *mut ffi::sqlite3_stmt = std::ptr::null_mut();
@@ -96,6 +126,51 @@ unsafe impl VTabCursor for ZstdCursor<'_> {
                 ffi::Error::new(rc),
                 Some("Failed to prepare SELECT statement".to_string()),
             ));
+        }
+
+        // Bind constraint values
+        for (i, value) in bind_values.iter().enumerate() {
+            let rc = match value {
+                rusqlite::types::Value::Null => unsafe {
+                    ffi::sqlite3_bind_null(stmt_ptr, (i + 1) as c_int)
+                },
+                rusqlite::types::Value::Integer(n) => unsafe {
+                    ffi::sqlite3_bind_int64(stmt_ptr, (i + 1) as c_int, *n)
+                },
+                rusqlite::types::Value::Real(f) => unsafe {
+                    ffi::sqlite3_bind_double(stmt_ptr, (i + 1) as c_int, *f)
+                },
+                rusqlite::types::Value::Text(s) => {
+                    let c_str = std::ffi::CString::new(s.as_str()).map_err(|_| {
+                        rusqlite::Error::ModuleError("Invalid string for binding".to_string())
+                    })?;
+                    unsafe {
+                        ffi::sqlite3_bind_text(
+                            stmt_ptr,
+                            (i + 1) as c_int,
+                            c_str.as_ptr(),
+                            -1,
+                            ffi::SQLITE_TRANSIENT(),
+                        )
+                    }
+                }
+                rusqlite::types::Value::Blob(b) => unsafe {
+                    ffi::sqlite3_bind_blob(
+                        stmt_ptr,
+                        (i + 1) as c_int,
+                        b.as_ptr() as *const _,
+                        b.len() as c_int,
+                        ffi::SQLITE_TRANSIENT(),
+                    )
+                },
+            };
+
+            if rc != ffi::SQLITE_OK {
+                return Err(rusqlite::Error::SqliteFailure(
+                    ffi::Error::new(rc),
+                    Some(format!("Failed to bind parameter {}", i + 1)),
+                ));
+            }
         }
 
         self.stmt = Some(stmt_ptr);

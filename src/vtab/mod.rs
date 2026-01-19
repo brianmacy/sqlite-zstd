@@ -9,8 +9,10 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
+pub mod conflict;
 pub mod cursor;
 pub mod zstd_vtab;
 
+pub use conflict::{get_conflict_mode, ConflictMode};
 pub use cursor::ZstdCursor;
 pub use zstd_vtab::{register_module, VTabConfig, ZstdVTab};

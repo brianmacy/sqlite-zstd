@@ -1,7 +1,12 @@
 //! Main virtual table implementation for zstd compression.
 
-use rusqlite::vtab::{IndexInfo, VTab, VTabConnection, sqlite3_vtab};
+use rusqlite::ffi;
+use rusqlite::types::{ToSqlOutput, Value, ValueRef};
+use rusqlite::vtab::{CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection, Values, sqlite3_vtab};
 use rusqlite::{Connection, Result};
+
+use crate::compression::{compress_with_marker, DEFAULT_COMPRESSION_LEVEL};
+use super::conflict::{get_conflict_mode, ConflictMode};
 
 /// Configuration for virtual table creation
 #[derive(Debug)]
@@ -15,6 +20,7 @@ pub struct VTabConfig {
 #[repr(C)]
 pub struct ZstdVTab {
     base: sqlite3_vtab,
+    db_handle: *mut ffi::sqlite3,
     pub underlying_table: String,
     pub compressed_columns: Vec<String>,
     pub all_columns: Vec<(String, String)>, // (name, type)
@@ -25,7 +31,7 @@ unsafe impl<'vtab> VTab<'vtab> for ZstdVTab {
     type Cursor = super::cursor::ZstdCursor<'vtab>;
 
     fn connect(
-        _db: &mut VTabConnection,
+        db: &mut VTabConnection,
         aux: Option<&Self::Aux>,
         _args: &[&[u8]],
     ) -> Result<(String, Self)> {
@@ -39,8 +45,12 @@ unsafe impl<'vtab> VTab<'vtab> for ZstdVTab {
         // Build schema DDL
         let schema = build_schema_ddl(&all_columns);
 
+        // Get database handle for later use in insert/update/delete operations
+        let db_handle = unsafe { db.handle() };
+
         let vtab = ZstdVTab {
             base: sqlite3_vtab::default(),
+            db_handle,
             underlying_table: config.underlying_table.clone(),
             compressed_columns: config.compressed_columns.clone(),
             all_columns,
@@ -56,6 +66,189 @@ unsafe impl<'vtab> VTab<'vtab> for ZstdVTab {
 
     fn open(&'vtab mut self) -> Result<Self::Cursor> {
         super::cursor::ZstdCursor::new(self)
+    }
+}
+
+impl<'vtab> CreateVTab<'vtab> for ZstdVTab {
+    const KIND: rusqlite::vtab::VTabKind = rusqlite::vtab::VTabKind::Default;
+}
+
+impl<'vtab> UpdateVTab<'vtab> for ZstdVTab {
+    fn insert(&mut self, args: &Values<'_>) -> Result<i64> {
+        // args[0] = old rowid (NULL for INSERT)
+        // args[1] = new rowid (NULL = auto-assign, otherwise explicit)
+        // args[2..] = column values
+
+        // Get ON CONFLICT mode
+        let conflict_mode = unsafe { get_conflict_mode(self.db_handle) };
+
+        // Prepare column values with compression
+        let mut values = Vec::new();
+        for (i, (col_name, _)) in self.all_columns.iter().enumerate() {
+            // Try to get as text first for compression
+            if self.compressed_columns.contains(col_name) {
+                if let Ok(text) = args.get::<String>(i + 2) {
+                    let compressed =
+                        compress_with_marker(&text, DEFAULT_COMPRESSION_LEVEL)
+                            .map_err(|e| {
+                                rusqlite::Error::ToSqlConversionFailure(
+                                    e.into(),
+                                )
+                            })?;
+                    values.push(Value::Blob(compressed));
+                } else {
+                    // Fall back to getting as a generic value
+                    let val: Value = args.get(i + 2)?;
+                    values.push(val);
+                }
+            } else {
+                let val: Value = args.get(i + 2)?;
+                values.push(val);
+            }
+        }
+
+        // Build INSERT statement
+        let col_names: Vec<_> = self
+            .all_columns
+            .iter()
+            .map(|(name, _)| format!("\"{}\"", name))
+            .collect();
+        let placeholders = vec!["?"; col_names.len()].join(", ");
+
+        let sql = match conflict_mode {
+            ConflictMode::Replace => {
+                format!(
+                    "INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
+                    self.underlying_table,
+                    col_names.join(", "),
+                    placeholders
+                )
+            }
+            ConflictMode::Ignore => {
+                format!(
+                    "INSERT OR IGNORE INTO \"{}\" ({}) VALUES ({})",
+                    self.underlying_table,
+                    col_names.join(", "),
+                    placeholders
+                )
+            }
+            _ => {
+                format!(
+                    "INSERT INTO \"{}\" ({}) VALUES ({})",
+                    self.underlying_table,
+                    col_names.join(", "),
+                    placeholders
+                )
+            }
+        };
+
+        // Execute INSERT and get rowid
+        // We need to use the raw database handle
+        let conn = unsafe { Connection::from_handle_owned(self.db_handle)? };
+        let mut stmt = conn.prepare(&sql)?;
+
+        // Bind parameters
+        for (i, value) in values.iter().enumerate() {
+            match value {
+                Value::Null => stmt.raw_bind_parameter(i + 1, value)?,
+                Value::Integer(n) => stmt.raw_bind_parameter(i + 1, n)?,
+                Value::Real(f) => stmt.raw_bind_parameter(i + 1, f)?,
+                Value::Text(s) => stmt.raw_bind_parameter(i + 1, s)?,
+                Value::Blob(b) => stmt.raw_bind_parameter(i + 1, b)?,
+            }
+        }
+
+        stmt.raw_execute()?;
+        drop(stmt); // Drop statement before accessing connection
+        let rowid = conn.last_insert_rowid();
+
+        // Don't drop the connection - SQLite owns it
+        std::mem::forget(conn);
+
+        Ok(rowid)
+    }
+
+    fn delete(&mut self, arg: ValueRef<'_>) -> Result<()> {
+        let rowid = arg.as_i64()?;
+        let sql = format!("DELETE FROM \"{}\" WHERE rowid = ?", self.underlying_table);
+
+        let conn = unsafe { Connection::from_handle_owned(self.db_handle)? };
+        conn.execute(&sql, [rowid])?;
+        std::mem::forget(conn);
+
+        Ok(())
+    }
+
+    fn update(&mut self, args: &Values<'_>) -> Result<()> {
+        // args[0] = old rowid (NOT NULL)
+        // args[1] = new rowid
+        // args[2..] = new column values
+
+        let old_rowid = args.get::<i64>(0)?;
+        let new_rowid = args.get::<i64>(1)?;
+
+        // Build SET clauses with compression
+        let mut set_clauses = Vec::new();
+        let mut values = Vec::new();
+
+        for (i, (col_name, _)) in self.all_columns.iter().enumerate() {
+            // Try to get as text first for compression
+            if self.compressed_columns.contains(col_name) {
+                if let Ok(text) = args.get::<String>(i + 2) {
+                    let compressed =
+                        compress_with_marker(&text, DEFAULT_COMPRESSION_LEVEL)
+                            .map_err(|e| {
+                                rusqlite::Error::ToSqlConversionFailure(
+                                    e.into(),
+                                )
+                            })?;
+                    values.push(Value::Blob(compressed));
+                } else {
+                    // Fall back to getting as a generic value
+                    let val: Value = args.get(i + 2)?;
+                    values.push(val);
+                }
+            } else {
+                let val: Value = args.get(i + 2)?;
+                values.push(val);
+            }
+
+            set_clauses.push(format!("\"{}\" = ?", col_name));
+        }
+
+        // Handle rowid change
+        if old_rowid != new_rowid {
+            set_clauses.push("rowid = ?".to_string());
+            values.push(Value::Integer(new_rowid));
+        }
+
+        values.push(Value::Integer(old_rowid));
+
+        let sql = format!(
+            "UPDATE \"{}\" SET {} WHERE rowid = ?",
+            self.underlying_table,
+            set_clauses.join(", ")
+        );
+
+        // Execute UPDATE
+        let conn = unsafe { Connection::from_handle_owned(self.db_handle)? };
+        let mut stmt = conn.prepare(&sql)?;
+
+        for (i, value) in values.iter().enumerate() {
+            match value {
+                Value::Null => stmt.raw_bind_parameter(i + 1, value)?,
+                Value::Integer(n) => stmt.raw_bind_parameter(i + 1, n)?,
+                Value::Real(f) => stmt.raw_bind_parameter(i + 1, f)?,
+                Value::Text(s) => stmt.raw_bind_parameter(i + 1, s)?,
+                Value::Blob(b) => stmt.raw_bind_parameter(i + 1, b)?,
+            }
+        }
+
+        stmt.raw_execute()?;
+        drop(stmt); // Drop statement before forgetting connection
+        std::mem::forget(conn);
+
+        Ok(())
     }
 }
 

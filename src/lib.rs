@@ -142,12 +142,15 @@ fn get_text_columns(conn: &Connection, table: &str) -> std::result::Result<Vec<S
         })
         .map_err(|e| format!("failed to query table info: {}", e))?
         .filter_map(|r| r.ok())
-        .filter(|(_, col_type)| col_type.to_uppercase() == "TEXT")
+        .filter(|(_, col_type)| {
+            let upper = col_type.to_uppercase();
+            upper == "TEXT" || upper == "CLOB" || upper.starts_with("CLOB(")
+        })
         .map(|(name, _)| name)
         .collect();
 
     if columns.is_empty() {
-        return Err(format!("table '{}' has no TEXT columns", table));
+        return Err(format!("table '{}' has no TEXT/CLOB columns", table));
     }
 
     Ok(columns)
@@ -215,16 +218,25 @@ fn zstd_enable_impl(
     // Get all columns and their types
     let all_columns = get_all_columns(conn, table)?;
 
+    // Helper to check if type is TEXT-like (TEXT, CLOB, CLOB(n))
+    let is_text_type = |col_type: &str| -> bool {
+        let upper = col_type.to_uppercase();
+        upper == "TEXT" || upper == "CLOB" || upper.starts_with("CLOB(")
+    };
+
     // Determine which columns to compress
     let compress_columns: Vec<String> = match columns {
         Some(cols) => {
-            // Validate specified columns exist and are TEXT
+            // Validate specified columns exist and are TEXT/CLOB
             for col in &cols {
                 let found = all_columns.iter().find(|(name, _)| name == col);
                 match found {
-                    Some((_, col_type)) if col_type.to_uppercase() == "TEXT" => {}
+                    Some((_, col_type)) if is_text_type(col_type) => {}
                     Some((_, col_type)) => {
-                        return Err(format!("column '{}' is type '{}', not TEXT", col, col_type));
+                        return Err(format!(
+                            "column '{}' is type '{}', not TEXT/CLOB",
+                            col, col_type
+                        ));
                     }
                     None => {
                         return Err(format!("column '{}' not found in table '{}'", col, table));

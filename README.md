@@ -78,6 +78,29 @@ SELECT zstd_disable('documents');
 SELECT zstd_disable('documents', 'content');
 ```
 
+### Query Optimization
+
+The virtual table implementation automatically optimizes queries with WHERE clauses:
+
+```sql
+-- Optimized: pushes constraint to underlying table
+SELECT * FROM documents WHERE id = 1;
+
+-- Optimized: range constraints also pushed down
+SELECT * FROM documents WHERE id > 100;
+SELECT * FROM documents WHERE id >= 50 AND id < 100;
+
+-- Full table scan (no constraints)
+SELECT * FROM documents;
+```
+
+You can verify optimization with EXPLAIN QUERY PLAN:
+
+```sql
+EXPLAIN QUERY PLAN SELECT * FROM documents WHERE id = 1;
+-- Shows: SCAN docs VIRTUAL TABLE INDEX 1:
+```
+
 ### Efficient Joins on Compressed Columns
 
 By default, joins on compressed columns decompress both sides for comparison. For equality joins, query the underlying `_zstd_<table>` tables directly to compare compressed BLOBs (zstd output is deterministic):
@@ -88,7 +111,7 @@ SELECT a.content FROM documents a
 JOIN other_docs b ON a.content = b.content;
 
 -- Efficient: compares compressed BLOBs directly using raw tables
-SELECT zstd_decompress(a.content) FROM _zstd_documents a
+SELECT zstd_decompress_marked(a.content) FROM _zstd_documents a
 JOIN _zstd_other_docs b ON a.content = b.content;
 ```
 

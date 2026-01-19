@@ -134,14 +134,58 @@ SELECT zstd_decompress(zstd_compress('Hello, World!'));
 
 For most TEXT data, the default level (3) provides a good balance. Use higher levels (19-22) for archival or when storage is critical.
 
+## Smart Compression
+
+The extension uses a **marker byte protocol** for intelligent compression:
+
+- **Small strings** (< 64 bytes): Stored uncompressed with `0x00` marker
+  - Avoids compression overhead for short text
+  - Examples: names, titles, short descriptions
+
+- **Large strings** (≥ 64 bytes): Compressed with zstd, prefixed with `0x01` marker
+  - Only compressed if it actually reduces size
+  - Falls back to uncompressed if compression doesn't help
+
+This approach:
+- Optimizes storage automatically without configuration
+- Ensures deterministic compression (same input = same output)
+- Enables efficient equality joins on compressed columns
+
+## ON CONFLICT Support
+
+The virtual table implementation supports all SQLite ON CONFLICT clauses:
+
+```sql
+-- Replace existing row if there's a conflict
+INSERT OR REPLACE INTO documents (id, title, content)
+VALUES (1, 'Updated', 'New content');
+
+-- Ignore the insert if there's a conflict
+INSERT OR IGNORE INTO documents (id, title, content)
+VALUES (1, 'Will be ignored', 'If id=1 exists');
+
+-- Other conflict modes
+INSERT OR ABORT ...   -- Abort the current statement (default)
+INSERT OR FAIL ...    -- Continue after error
+INSERT OR ROLLBACK ...  -- Rollback the entire transaction
+```
+
+This was impossible with the previous view+triggers architecture and is a major advantage of virtual tables.
+
 ## How It Works
 
 When you call `zstd_enable()`, the extension:
 
-1. Renames the original table (e.g., `documents` → `_zstd_documents`)
-2. Creates a view with the original table name that auto-decompresses on SELECT
-3. Creates INSTEAD OF triggers that auto-compress on INSERT/UPDATE
+1. Registers the `zstd` virtual table module with SQLite
+2. Renames the original table (e.g., `documents` → `_zstd_documents`)
+3. Creates a virtual table with the original table name
 4. Stores configuration in `_zstd_config` table
+
+The virtual table:
+- Intercepts all INSERT/UPDATE operations to compress TEXT columns
+- Intercepts all SELECT operations to decompress compressed columns
+- Supports ON CONFLICT clauses (REPLACE, IGNORE, etc.)
+- Provides direct control over read/write operations
 
 This approach uses standard SQL types and works with all ORMs and database tools.
 

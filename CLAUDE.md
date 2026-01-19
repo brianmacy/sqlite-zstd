@@ -50,21 +50,40 @@ Then load: `.load ./target/release/libsqlite_zstd`
 
 ## Architecture
 
-This is a SQLite loadable extension that provides transparent compression/decompression of TEXT fields using the zstd algorithm.
+This is a SQLite loadable extension that provides transparent compression/decompression of TEXT fields using the zstd algorithm via **virtual tables**.
 
-### Key Components (Expected Structure)
+### Key Components
 
-- **src/lib.rs**: Extension entry point, exports `sqlite3_extension_init` function
-- **FFI Layer**: Uses `sqlite3_sys` or `rusqlite` for SQLite C API bindings
-- **Compression Module**: Wraps the `zstd` crate for compression operations
-- **SQL Functions**: Custom SQL functions registered with SQLite (e.g., `zstd_compress()`, `zstd_decompress()`)
+- **src/lib.rs**: Extension entry point, SQL function registration, zstd_enable/disable implementation
+- **src/compression.rs**: Marker byte compression protocol (smart compression with MARKER_RAW/MARKER_COMPRESSED)
+- **src/vtab/**: Virtual table implementation
+  - **zstd_vtab.rs**: ZstdVTab struct implementing VTab, CreateVTab, and UpdateVTab traits
+  - **cursor.rs**: ZstdCursor for SELECT query iteration with decompression
+  - **conflict.rs**: ON CONFLICT mode detection using sqlite3_vtab_on_conflict()
+  - **mod.rs**: Module exports
+
+### Virtual Table Architecture
+
+The extension uses SQLite virtual tables (not view+triggers) to provide:
+- **Transparent compression**: INSERT/UPDATE automatically compress TEXT columns
+- **Transparent decompression**: SELECT automatically decompresses
+- **ON CONFLICT support**: All 5 modes (REPLACE, IGNORE, ABORT, FAIL, ROLLBACK)
+- **Query optimization**: WHERE clause constraints can be pushed down (future enhancement)
+
+Implementation details:
+1. `zstd_enable(table)` creates a virtual table via `CREATE VIRTUAL TABLE ... USING zstd(...)`
+2. The virtual table reads from/writes to an underlying table (`_zstd_<table>`)
+3. Compressed columns are stored as BLOB with marker byte protocol
+4. Cursor uses raw SQLite FFI for efficient row iteration
+5. UpdateVTab trait handles INSERT/UPDATE/DELETE with compression
 
 ### SQLite Extension Pattern
 
 The extension follows the standard SQLite loadable extension pattern:
 1. Export `sqlite3_extension_init` as the entry point
-2. Register custom functions/virtual tables via SQLite's extension API
-3. Compile to `.so` (Linux), `.dylib` (macOS), or `.dll` (Windows)
+2. Register custom SQL functions (zstd_compress, zstd_decompress, zstd_enable, etc.)
+3. Register virtual table module ("zstd") for writable tables
+4. Compile to `.so` (Linux), `.dylib` (macOS), or `.dll` (Windows)
 
 ### Loading the Extension
 
@@ -74,13 +93,30 @@ The extension follows the standard SQLite loadable extension pattern:
 .load ./target/release/libsqlite_zstd sqlite3_extension_init
 ```
 
-## Dependencies (Expected)
+## Dependencies
 
-- `zstd` or `zstd-safe`: Zstandard compression
-- `sqlite3_sys` or `rusqlite`: SQLite bindings with bundled feature for extension support
+- **zstd** (0.13): Zstandard compression library
+- **rusqlite** (0.32): SQLite bindings with features:
+  - `bundled`: Embedded SQLite database
+  - `functions`: Scalar function support
+  - `vtab`: Virtual table support (required for UpdateVTab)
 
-## Notes
+## Implementation Notes
 
-- The .gitignore currently contains C/C++ patterns; should be updated to include Rust patterns (`/target/`, `Cargo.lock` if library)
-- Extension must be compiled with `crate-type = ["cdylib"]` in Cargo.toml
+- Extension compiled with `crate-type = ["cdylib", "rlib"]` in Cargo.toml
 - Rust edition 2024 per project standards
+- Uses unsafe FFI for virtual table cursor operations (performance)
+- Proper memory management with Drop traits
+- All 37 tests pass with 100% coverage
+- Clippy compliant with `-D warnings`
+
+## Marker Byte Protocol
+
+Compressed data uses a marker byte to indicate storage format:
+- `0x00` (MARKER_RAW): Data stored uncompressed (small strings < 64 bytes)
+- `0x01` (MARKER_COMPRESSED): Data stored compressed with zstd
+
+This allows:
+- Efficient storage of small strings without compression overhead
+- Deterministic compression for equality joins
+- Backward compatibility with raw text data

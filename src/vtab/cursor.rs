@@ -1,9 +1,8 @@
 //! Cursor implementation for zstd virtual table.
 
 use rusqlite::ffi;
-use rusqlite::types::{Type, Value, ValueRef};
 use rusqlite::vtab::{sqlite3_vtab_cursor, Context, VTabCursor};
-use rusqlite::{Connection, Result, Statement};
+use rusqlite::Result;
 use std::marker::PhantomData;
 use std::os::raw::c_int;
 
@@ -71,7 +70,10 @@ unsafe impl VTabCursor for ZstdCursor<'_> {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let sql = format!("SELECT {} FROM \"{}\"", col_list, self.vtab.underlying_table);
+        let sql = format!(
+            "SELECT {} FROM \"{}\"",
+            col_list, self.vtab.underlying_table
+        );
 
         // Prepare statement using raw SQLite API
         let mut stmt_ptr: *mut ffi::sqlite3_stmt = std::ptr::null_mut();
@@ -134,9 +136,9 @@ unsafe impl VTabCursor for ZstdCursor<'_> {
     }
 
     fn column(&self, ctx: &mut Context, col: c_int) -> Result<()> {
-        let stmt = self.stmt.ok_or_else(|| {
-            rusqlite::Error::ModuleError("No statement available".to_string())
-        })?;
+        let stmt = self
+            .stmt
+            .ok_or_else(|| rusqlite::Error::ModuleError("No statement available".to_string()))?;
 
         // col is 0-indexed in the virtual table
         // but in our SELECT query, column 0 is rowid, so actual columns start at 1
@@ -165,8 +167,7 @@ unsafe impl VTabCursor for ZstdCursor<'_> {
                     let text_ptr = ffi::sqlite3_column_text(stmt, stmt_col);
                     let text_len = ffi::sqlite3_column_bytes(stmt, stmt_col);
                     if !text_ptr.is_null() && text_len > 0 {
-                        let text_slice =
-                            std::slice::from_raw_parts(text_ptr, text_len as usize);
+                        let text_slice = std::slice::from_raw_parts(text_ptr, text_len as usize);
                         let text_str = std::str::from_utf8(text_slice).map_err(|_| {
                             rusqlite::Error::ModuleError("Invalid UTF-8".to_string())
                         })?;

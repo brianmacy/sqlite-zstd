@@ -136,33 +136,43 @@ fn zstd_enable_impl(
 
     let raw_table = format!("{}{}", TABLE_PREFIX, table);
 
-    // Check if already enabled (check for existing virtual table or view)
-    let existing: Option<String> = conn
+    // Check if it's already a zstd virtual table
+    let is_vtab: bool = conn
         .query_row(
-            "SELECT type FROM sqlite_master WHERE name=? AND type IN ('view', 'table')",
+            "SELECT 1 FROM sqlite_master WHERE name=? AND sql LIKE 'CREATE VIRTUAL TABLE%'",
             [table],
-            |row| row.get(0),
+            |_| Ok(true),
         )
-        .ok();
+        .unwrap_or(false);
 
-    if let Some(obj_type) = existing {
-        // Check if it's already a virtual table
-        let is_vtab: bool = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE name=? AND sql LIKE 'CREATE VIRTUAL TABLE%'",
-                [table],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
+    if is_vtab {
+        return Err(format!("table '{}' is already a zstd virtual table", table));
+    }
 
-        if is_vtab {
-            return Err(format!("table '{}' is already a zstd virtual table", table));
-        } else {
-            return Err(format!(
-                "table '{}' is already compressed or is a {}",
-                table, obj_type
-            ));
-        }
+    // Check if it's a view (views can't be compressed)
+    let is_view: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE name=? AND type='view'",
+            [table],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+
+    if is_view {
+        return Err(format!("'{}' is a view, not a table", table));
+    }
+
+    // Check that a table with this name exists
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE name=? AND type='table'",
+            [table],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+
+    if !table_exists {
+        return Err(format!("table '{}' does not exist", table));
     }
 
     // Get all columns and their types
@@ -207,7 +217,8 @@ fn zstd_enable_impl(
 
     let result = (|| -> std::result::Result<String, String> {
         // Register the virtual table module (idempotent - safe to call multiple times)
-        vtab::register_module(conn).map_err(|e| format!("failed to register zstd module: {}", e))?;
+        vtab::register_module(conn)
+            .map_err(|e| format!("failed to register zstd module: {}", e))?;
 
         // Rename original table to underlying table
         conn.execute(
@@ -216,20 +227,22 @@ fn zstd_enable_impl(
         )
         .map_err(|e| format!("failed to rename table: {}", e))?;
 
-        // Build schema string: "col1:TYPE1,col2:TYPE2,..."
+        // Build schema string: "col1:TYPE1|col2:TYPE2|..."
+        // Use | as delimiter because commas are interpreted as SQL argument separators
         let schema_str = all_columns
             .iter()
             .map(|(name, col_type)| format!("{}:{}", name, col_type))
             .collect::<Vec<_>>()
-            .join(",");
+            .join("|");
 
-        // Build compressed columns string: "col1,col2,..."
-        let compressed_cols_str = compress_columns.join(",");
+        // Build compressed columns string: "col1|col2|..."
+        let compressed_cols_str = compress_columns.join("|");
 
         // Create virtual table
-        // Format: CREATE VIRTUAL TABLE name USING zstd('underlying', 'cols', 'schema')
+        // Format: CREATE VIRTUAL TABLE name USING zstd(underlying, cols, schema)
+        // Note: Don't use quotes around arguments - they become part of the argument value!
         let create_vtab = format!(
-            "CREATE VIRTUAL TABLE \"{}\" USING zstd('{}', '{}', '{}')",
+            "CREATE VIRTUAL TABLE \"{}\" USING zstd({}, {}, {})",
             table, raw_table, compressed_cols_str, schema_str
         );
         conn.execute(&create_vtab, [])
@@ -358,18 +371,18 @@ fn zstd_disable_impl(
                 conn.execute(&format!("DROP TABLE \"{}\"", table), [])
                     .map_err(|e| format!("failed to drop virtual table: {}", e))?;
 
-                // Build new schema string
+                // Build new schema string (use | delimiter)
                 let schema_str = all_columns
                     .iter()
                     .map(|(name, col_type)| format!("{}:{}", name, col_type))
                     .collect::<Vec<_>>()
-                    .join(",");
+                    .join("|");
 
-                let compressed_cols_str = remaining_columns.join(",");
+                let compressed_cols_str = remaining_columns.join("|");
 
                 // Recreate virtual table
                 let create_vtab = format!(
-                    "CREATE VIRTUAL TABLE \"{}\" USING zstd('{}', '{}', '{}')",
+                    "CREATE VIRTUAL TABLE \"{}\" USING zstd({}, {}, {})",
                     table, raw_table, compressed_cols_str, schema_str
                 );
                 conn.execute(&create_vtab, [])
@@ -790,12 +803,10 @@ pub unsafe extern "C" fn sqlite3_extension_init(
 // Tests
 // =============================================================================
 
-// TEMPORARILY COMMENTED OUT DURING VTAB MIGRATION
-// Will be updated and uncommented in Phase 5
-/*
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compression::{MARKER_COMPRESSED, MARKER_RAW};
     use rusqlite::Connection;
 
     fn setup_test_db() -> Connection {
@@ -1003,17 +1014,17 @@ mod tests {
         conn.query_row("SELECT zstd_enable('documents')", [], |_| Ok(()))
             .unwrap();
 
-        // Verify the view exists
-        let view_exists: i32 = conn
+        // Verify the virtual table exists
+        let vtab_exists: bool = conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='view' AND name='documents'",
+                "SELECT 1 FROM sqlite_master WHERE name='documents' AND sql LIKE 'CREATE VIRTUAL TABLE%'",
                 [],
-                |row| row.get(0),
+                |_| Ok(true),
             )
-            .unwrap();
-        assert_eq!(view_exists, 1, "View should be created");
+            .unwrap_or(false);
+        assert!(vtab_exists, "Virtual table should be created");
 
-        // Verify the raw table exists
+        // Verify the underlying table exists
         let raw_table_exists: i32 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='_zstd_documents'",
@@ -1021,7 +1032,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(raw_table_exists, 1, "Raw table should exist");
+        assert_eq!(raw_table_exists, 1, "Underlying table should exist");
     }
 
     #[test]
@@ -1507,4 +1518,3 @@ mod tests {
         assert_eq!(content, large_text);
     }
 }
-*/

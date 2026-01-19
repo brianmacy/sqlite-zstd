@@ -22,7 +22,8 @@ pub enum ConflictMode {
 }
 
 impl ConflictMode {
-    /// Convert to SQL clause text
+    /// Convert to SQL clause text (reserved for future use)
+    #[allow(dead_code)]
     pub fn to_sql_clause(self) -> &'static str {
         match self {
             ConflictMode::Rollback => "OR ROLLBACK",

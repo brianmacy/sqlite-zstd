@@ -1,17 +1,18 @@
 //! Main virtual table implementation for zstd compression.
 
 use rusqlite::ffi;
-use rusqlite::types::{ToSqlOutput, Value, ValueRef};
+use rusqlite::types::{Value, ValueRef};
 use rusqlite::vtab::{
-    update_module, CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection, Values, sqlite3_vtab,
+    sqlite3_vtab, update_module, CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection, Values,
 };
 use rusqlite::{Connection, Result};
 
-use crate::compression::{compress_with_marker, DEFAULT_COMPRESSION_LEVEL};
 use super::conflict::{get_conflict_mode, ConflictMode};
+use crate::compression::{compress_with_marker, DEFAULT_COMPRESSION_LEVEL};
 
-/// Configuration for virtual table creation
+/// Configuration for virtual table creation (reserved for future use)
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct VTabConfig {
     pub underlying_table: String,
     pub compressed_columns: Vec<String>,
@@ -38,19 +39,19 @@ unsafe impl<'vtab> VTab<'vtab> for ZstdVTab {
         args: &[&[u8]],
     ) -> Result<(String, Self)> {
         // Parse arguments from CREATE VIRTUAL TABLE statement
-        // Format: CREATE VIRTUAL TABLE name USING zstd('underlying', 'cols', 'schema')
+        // Format: CREATE VIRTUAL TABLE name USING zstd(underlying, cols, schema)
         // args[0] = module name ("zstd")
         // args[1] = database name
         // args[2] = table name
         // args[3] = underlying table name
-        // args[4] = comma-separated compressed column names
-        // args[5] = comma-separated schema: "col1:TYPE1,col2:TYPE2,..."
+        // args[4] = pipe-separated compressed column names: col1|col2|...
+        // args[5] = pipe-separated schema: col1:TYPE1|col2:TYPE2|...
 
         if args.len() < 6 {
-            return Err(rusqlite::Error::ModuleError(
-                "zstd virtual table requires 3 arguments: underlying_table, compressed_cols, schema"
-                    .to_string(),
-            ));
+            return Err(rusqlite::Error::ModuleError(format!(
+                "zstd virtual table requires 3 arguments: underlying_table, compressed_cols, schema (got {} args)",
+                args.len()
+            )));
         }
 
         // Parse underlying table name
@@ -58,20 +59,23 @@ unsafe impl<'vtab> VTab<'vtab> for ZstdVTab {
             .map_err(|e| rusqlite::Error::ModuleError(format!("Invalid UTF-8: {}", e)))?
             .to_string();
 
-        // Parse compressed column names (comma-separated)
+        // Parse compressed column names (pipe-separated: col1|col2|...)
         let compressed_cols_str = std::str::from_utf8(args[4])
             .map_err(|e| rusqlite::Error::ModuleError(format!("Invalid UTF-8: {}", e)))?;
         let compressed_columns: Vec<String> = if compressed_cols_str.is_empty() {
             Vec::new()
         } else {
-            compressed_cols_str.split(',').map(|s| s.trim().to_string()).collect()
+            compressed_cols_str
+                .split('|')
+                .map(|s| s.trim().to_string())
+                .collect()
         };
 
-        // Parse schema (format: "col1:TYPE1,col2:TYPE2,...")
+        // Parse schema (format: "col1:TYPE1|col2:TYPE2|...")
         let schema_str = std::str::from_utf8(args[5])
             .map_err(|e| rusqlite::Error::ModuleError(format!("Invalid UTF-8: {}", e)))?;
         let mut all_columns = Vec::new();
-        for col_def in schema_str.split(',') {
+        for col_def in schema_str.split('|') {
             let parts: Vec<&str> = col_def.split(':').collect();
             if parts.len() != 2 {
                 return Err(rusqlite::Error::ModuleError(format!(
@@ -128,13 +132,8 @@ impl<'vtab> UpdateVTab<'vtab> for ZstdVTab {
             // Try to get as text first for compression
             if self.compressed_columns.contains(col_name) {
                 if let Ok(text) = args.get::<String>(i + 2) {
-                    let compressed =
-                        compress_with_marker(&text, DEFAULT_COMPRESSION_LEVEL)
-                            .map_err(|e| {
-                                rusqlite::Error::ToSqlConversionFailure(
-                                    e.into(),
-                                )
-                            })?;
+                    let compressed = compress_with_marker(&text, DEFAULT_COMPRESSION_LEVEL)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
                     values.push(Value::Blob(compressed));
                 } else {
                     // Fall back to getting as a generic value
@@ -235,13 +234,8 @@ impl<'vtab> UpdateVTab<'vtab> for ZstdVTab {
             // Try to get as text first for compression
             if self.compressed_columns.contains(col_name) {
                 if let Ok(text) = args.get::<String>(i + 2) {
-                    let compressed =
-                        compress_with_marker(&text, DEFAULT_COMPRESSION_LEVEL)
-                            .map_err(|e| {
-                                rusqlite::Error::ToSqlConversionFailure(
-                                    e.into(),
-                                )
-                            })?;
+                    let compressed = compress_with_marker(&text, DEFAULT_COMPRESSION_LEVEL)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
                     values.push(Value::Blob(compressed));
                 } else {
                     // Fall back to getting as a generic value

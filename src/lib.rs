@@ -123,7 +123,7 @@ fn get_all_columns(
 // Enable/Disable Functions
 // =============================================================================
 
-/// Enable compression for a table.
+/// Enable compression for a table using virtual tables.
 fn zstd_enable_impl(
     conn: &Connection,
     table: &str,
@@ -136,20 +136,33 @@ fn zstd_enable_impl(
 
     let raw_table = format!("{}{}", TABLE_PREFIX, table);
 
-    // Check if already enabled (view exists with this name)
+    // Check if already enabled (check for existing virtual table or view)
     let existing: Option<String> = conn
         .query_row(
-            "SELECT name FROM sqlite_master WHERE type='view' AND name=?",
+            "SELECT type FROM sqlite_master WHERE name=? AND type IN ('view', 'table')",
             [table],
             |row| row.get(0),
         )
         .ok();
 
-    if existing.is_some() {
-        return Err(format!(
-            "table '{}' is already compressed or is a view",
-            table
-        ));
+    if let Some(obj_type) = existing {
+        // Check if it's already a virtual table
+        let is_vtab: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE name=? AND sql LIKE 'CREATE VIRTUAL TABLE%'",
+                [table],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if is_vtab {
+            return Err(format!("table '{}' is already a zstd virtual table", table));
+        } else {
+            return Err(format!(
+                "table '{}' is already compressed or is a {}",
+                table, obj_type
+            ));
+        }
     }
 
     // Get all columns and their types
@@ -193,100 +206,34 @@ fn zstd_enable_impl(
         .map_err(|e| format!("failed to begin transaction: {}", e))?;
 
     let result = (|| -> std::result::Result<String, String> {
-        // Rename original table
+        // Register the virtual table module (idempotent - safe to call multiple times)
+        vtab::register_module(conn).map_err(|e| format!("failed to register zstd module: {}", e))?;
+
+        // Rename original table to underlying table
         conn.execute(
             &format!("ALTER TABLE \"{}\" RENAME TO \"{}\"", table, raw_table),
             [],
         )
         .map_err(|e| format!("failed to rename table: {}", e))?;
 
-        // Build SELECT list for view (decompress compressed columns)
-        // Include rowid for UPDATE/DELETE triggers to work
-        let mut select_list: Vec<String> = vec![format!("\"{}\".rowid AS rowid", raw_table)];
-        select_list.extend(all_columns.iter().map(|(name, _)| {
-            if compress_columns.contains(name) {
-                format!("zstd_decompress_marked(\"{}\") AS \"{}\"", name, name)
-            } else {
-                format!("\"{}\"", name)
-            }
-        }));
-
-        // Create view
-        let create_view = format!(
-            "CREATE VIEW \"{}\" AS SELECT {} FROM \"{}\"",
-            table,
-            select_list.join(", "),
-            raw_table
-        );
-        conn.execute(&create_view, [])
-            .map_err(|e| format!("failed to create view: {}", e))?;
-
-        // Build column lists for triggers
-        let column_names: Vec<String> = all_columns
+        // Build schema string: "col1:TYPE1,col2:TYPE2,..."
+        let schema_str = all_columns
             .iter()
-            .map(|(name, _)| format!("\"{}\"", name))
-            .collect();
-        let insert_values: Vec<String> = all_columns
-            .iter()
-            .map(|(name, _)| {
-                if compress_columns.contains(name) {
-                    format!("zstd_compress_marked(NEW.\"{}\")", name)
-                } else {
-                    format!("NEW.\"{}\"", name)
-                }
-            })
-            .collect();
+            .map(|(name, col_type)| format!("{}:{}", name, col_type))
+            .collect::<Vec<_>>()
+            .join(",");
 
-        // Create INSERT trigger
-        let insert_trigger = format!(
-            "CREATE TRIGGER \"_zstd_{}_insert\" INSTEAD OF INSERT ON \"{}\"
-            BEGIN
-                INSERT INTO \"{}\" ({}) VALUES ({});
-            END",
-            table,
-            table,
-            raw_table,
-            column_names.join(", "),
-            insert_values.join(", ")
+        // Build compressed columns string: "col1,col2,..."
+        let compressed_cols_str = compress_columns.join(",");
+
+        // Create virtual table
+        // Format: CREATE VIRTUAL TABLE name USING zstd('underlying', 'cols', 'schema')
+        let create_vtab = format!(
+            "CREATE VIRTUAL TABLE \"{}\" USING zstd('{}', '{}', '{}')",
+            table, raw_table, compressed_cols_str, schema_str
         );
-        conn.execute(&insert_trigger, [])
-            .map_err(|e| format!("failed to create insert trigger: {}", e))?;
-
-        // Create UPDATE trigger
-        let update_sets: Vec<String> = all_columns
-            .iter()
-            .map(|(name, _)| {
-                if compress_columns.contains(name) {
-                    format!("\"{}\" = zstd_compress_marked(NEW.\"{}\")", name, name)
-                } else {
-                    format!("\"{}\" = NEW.\"{}\"", name, name)
-                }
-            })
-            .collect();
-
-        let update_trigger = format!(
-            "CREATE TRIGGER \"_zstd_{}_update\" INSTEAD OF UPDATE ON \"{}\"
-            BEGIN
-                UPDATE \"{}\" SET {} WHERE rowid = OLD.rowid;
-            END",
-            table,
-            table,
-            raw_table,
-            update_sets.join(", ")
-        );
-        conn.execute(&update_trigger, [])
-            .map_err(|e| format!("failed to create update trigger: {}", e))?;
-
-        // Create DELETE trigger
-        let delete_trigger = format!(
-            "CREATE TRIGGER \"_zstd_{}_delete\" INSTEAD OF DELETE ON \"{}\"
-            BEGIN
-                DELETE FROM \"{}\" WHERE rowid = OLD.rowid;
-            END",
-            table, table, raw_table
-        );
-        conn.execute(&delete_trigger, [])
-            .map_err(|e| format!("failed to create delete trigger: {}", e))?;
+        conn.execute(&create_vtab, [])
+            .map_err(|e| format!("failed to create virtual table: {}", e))?;
 
         // Store config
         for col in &compress_columns {
@@ -390,7 +337,7 @@ fn zstd_disable_impl(
                 )
                 .map_err(|e| format!("failed to remove config: {}", e))?;
 
-                // Decompress the column in the raw table
+                // Decompress the column in the underlying table
                 conn.execute(
                     &format!(
                         "UPDATE \"{}\" SET \"{}\" = zstd_decompress_marked(\"{}\")",
@@ -400,11 +347,33 @@ fn zstd_disable_impl(
                 )
                 .map_err(|e| format!("failed to decompress column: {}", e))?;
 
-                // Recreate view and triggers with updated column list
+                // Drop and recreate virtual table with updated column list
                 let remaining_columns: Vec<String> =
                     columns.into_iter().filter(|c| c != col).collect();
 
-                recreate_view_and_triggers(conn, table, &raw_table, &remaining_columns)?;
+                // Get all columns from underlying table
+                let all_columns = get_all_columns(conn, &raw_table)?;
+
+                // Drop existing virtual table
+                conn.execute(&format!("DROP TABLE \"{}\"", table), [])
+                    .map_err(|e| format!("failed to drop virtual table: {}", e))?;
+
+                // Build new schema string
+                let schema_str = all_columns
+                    .iter()
+                    .map(|(name, col_type)| format!("{}:{}", name, col_type))
+                    .collect::<Vec<_>>()
+                    .join(",");
+
+                let compressed_cols_str = remaining_columns.join(",");
+
+                // Recreate virtual table
+                let create_vtab = format!(
+                    "CREATE VIRTUAL TABLE \"{}\" USING zstd('{}', '{}', '{}')",
+                    table, raw_table, compressed_cols_str, schema_str
+                );
+                conn.execute(&create_vtab, [])
+                    .map_err(|e| format!("failed to recreate virtual table: {}", e))?;
 
                 Ok(format!("Disabled compression on column '{}'", col))
             }
@@ -428,7 +397,7 @@ fn zstd_disable_impl(
     }
 }
 
-/// Disable compression on entire table - helper function.
+/// Disable compression on entire table - helper function (virtual table version).
 fn zstd_disable_table(
     conn: &Connection,
     table: &str,
@@ -450,7 +419,7 @@ fn zstd_disable_table(
 
     drop(stmt);
 
-    // Decompress all compressed columns
+    // Decompress all compressed columns in underlying table
     for col in &columns {
         conn.execute(
             &format!(
@@ -462,28 +431,11 @@ fn zstd_disable_table(
         .map_err(|e| format!("failed to decompress column '{}': {}", col, e))?;
     }
 
-    // Drop triggers
-    conn.execute(
-        &format!("DROP TRIGGER IF EXISTS \"_zstd_{}_insert\"", table),
-        [],
-    )
-    .map_err(|e| format!("failed to drop insert trigger: {}", e))?;
-    conn.execute(
-        &format!("DROP TRIGGER IF EXISTS \"_zstd_{}_update\"", table),
-        [],
-    )
-    .map_err(|e| format!("failed to drop update trigger: {}", e))?;
-    conn.execute(
-        &format!("DROP TRIGGER IF EXISTS \"_zstd_{}_delete\"", table),
-        [],
-    )
-    .map_err(|e| format!("failed to drop delete trigger: {}", e))?;
+    // Drop virtual table
+    conn.execute(&format!("DROP TABLE IF EXISTS \"{}\"", table), [])
+        .map_err(|e| format!("failed to drop virtual table: {}", e))?;
 
-    // Drop view
-    conn.execute(&format!("DROP VIEW IF EXISTS \"{}\"", table), [])
-        .map_err(|e| format!("failed to drop view: {}", e))?;
-
-    // Rename table back
+    // Rename underlying table back to original name
     conn.execute(
         &format!("ALTER TABLE \"{}\" RENAME TO \"{}\"", raw_table, table),
         [],
@@ -502,121 +454,6 @@ fn zstd_disable_table(
         table,
         columns.len()
     ))
-}
-
-/// Recreate view and triggers after modifying compressed columns.
-fn recreate_view_and_triggers(
-    conn: &Connection,
-    table: &str,
-    raw_table: &str,
-    compress_columns: &[String],
-) -> std::result::Result<(), String> {
-    // Get all columns
-    let all_columns = get_all_columns(conn, raw_table)?;
-
-    // Drop existing view and triggers
-    conn.execute(
-        &format!("DROP TRIGGER IF EXISTS \"_zstd_{}_insert\"", table),
-        [],
-    )
-    .map_err(|e| format!("failed to drop insert trigger: {}", e))?;
-    conn.execute(
-        &format!("DROP TRIGGER IF EXISTS \"_zstd_{}_update\"", table),
-        [],
-    )
-    .map_err(|e| format!("failed to drop update trigger: {}", e))?;
-    conn.execute(
-        &format!("DROP TRIGGER IF EXISTS \"_zstd_{}_delete\"", table),
-        [],
-    )
-    .map_err(|e| format!("failed to drop delete trigger: {}", e))?;
-    conn.execute(&format!("DROP VIEW IF EXISTS \"{}\"", table), [])
-        .map_err(|e| format!("failed to drop view: {}", e))?;
-
-    // Recreate view with rowid for UPDATE/DELETE triggers
-    let mut select_list: Vec<String> = vec![format!("\"{}\".rowid AS rowid", raw_table)];
-    select_list.extend(all_columns.iter().map(|(name, _)| {
-        if compress_columns.contains(name) {
-            format!("zstd_decompress_marked(\"{}\") AS \"{}\"", name, name)
-        } else {
-            format!("\"{}\"", name)
-        }
-    }));
-
-    let create_view = format!(
-        "CREATE VIEW \"{}\" AS SELECT {} FROM \"{}\"",
-        table,
-        select_list.join(", "),
-        raw_table
-    );
-    conn.execute(&create_view, [])
-        .map_err(|e| format!("failed to create view: {}", e))?;
-
-    // Recreate triggers
-    let column_names: Vec<String> = all_columns
-        .iter()
-        .map(|(name, _)| format!("\"{}\"", name))
-        .collect();
-    let insert_values: Vec<String> = all_columns
-        .iter()
-        .map(|(name, _)| {
-            if compress_columns.contains(name) {
-                format!("zstd_compress_marked(NEW.\"{}\")", name)
-            } else {
-                format!("NEW.\"{}\"", name)
-            }
-        })
-        .collect();
-
-    let insert_trigger = format!(
-        "CREATE TRIGGER \"_zstd_{}_insert\" INSTEAD OF INSERT ON \"{}\"
-        BEGIN
-            INSERT INTO \"{}\" ({}) VALUES ({});
-        END",
-        table,
-        table,
-        raw_table,
-        column_names.join(", "),
-        insert_values.join(", ")
-    );
-    conn.execute(&insert_trigger, [])
-        .map_err(|e| format!("failed to create insert trigger: {}", e))?;
-
-    let update_sets: Vec<String> = all_columns
-        .iter()
-        .map(|(name, _)| {
-            if compress_columns.contains(name) {
-                format!("\"{}\" = zstd_compress_marked(NEW.\"{}\")", name, name)
-            } else {
-                format!("\"{}\" = NEW.\"{}\"", name, name)
-            }
-        })
-        .collect();
-
-    let update_trigger = format!(
-        "CREATE TRIGGER \"_zstd_{}_update\" INSTEAD OF UPDATE ON \"{}\"
-        BEGIN
-            UPDATE \"{}\" SET {} WHERE rowid = OLD.rowid;
-        END",
-        table,
-        table,
-        raw_table,
-        update_sets.join(", ")
-    );
-    conn.execute(&update_trigger, [])
-        .map_err(|e| format!("failed to create update trigger: {}", e))?;
-
-    let delete_trigger = format!(
-        "CREATE TRIGGER \"_zstd_{}_delete\" INSTEAD OF DELETE ON \"{}\"
-        BEGIN
-            DELETE FROM \"{}\" WHERE rowid = OLD.rowid;
-        END",
-        table, table, raw_table
-    );
-    conn.execute(&delete_trigger, [])
-        .map_err(|e| format!("failed to create delete trigger: {}", e))?;
-
-    Ok(())
 }
 
 /// List compressed columns in a table.

@@ -2,7 +2,9 @@
 
 use rusqlite::ffi;
 use rusqlite::types::{ToSqlOutput, Value, ValueRef};
-use rusqlite::vtab::{CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection, Values, sqlite3_vtab};
+use rusqlite::vtab::{
+    update_module, CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection, Values, sqlite3_vtab,
+};
 use rusqlite::{Connection, Result};
 
 use crate::compression::{compress_with_marker, DEFAULT_COMPRESSION_LEVEL};
@@ -32,15 +34,53 @@ unsafe impl<'vtab> VTab<'vtab> for ZstdVTab {
 
     fn connect(
         db: &mut VTabConnection,
-        aux: Option<&Self::Aux>,
-        _args: &[&[u8]],
+        _aux: Option<&Self::Aux>,
+        args: &[&[u8]],
     ) -> Result<(String, Self)> {
-        // Get configuration from aux
-        let config = aux
-            .ok_or_else(|| rusqlite::Error::ModuleError("No configuration provided".to_string()))?;
+        // Parse arguments from CREATE VIRTUAL TABLE statement
+        // Format: CREATE VIRTUAL TABLE name USING zstd('underlying', 'cols', 'schema')
+        // args[0] = module name ("zstd")
+        // args[1] = database name
+        // args[2] = table name
+        // args[3] = underlying table name
+        // args[4] = comma-separated compressed column names
+        // args[5] = comma-separated schema: "col1:TYPE1,col2:TYPE2,..."
 
-        // Get column information from config
-        let all_columns = config.all_columns.clone();
+        if args.len() < 6 {
+            return Err(rusqlite::Error::ModuleError(
+                "zstd virtual table requires 3 arguments: underlying_table, compressed_cols, schema"
+                    .to_string(),
+            ));
+        }
+
+        // Parse underlying table name
+        let underlying_table = std::str::from_utf8(args[3])
+            .map_err(|e| rusqlite::Error::ModuleError(format!("Invalid UTF-8: {}", e)))?
+            .to_string();
+
+        // Parse compressed column names (comma-separated)
+        let compressed_cols_str = std::str::from_utf8(args[4])
+            .map_err(|e| rusqlite::Error::ModuleError(format!("Invalid UTF-8: {}", e)))?;
+        let compressed_columns: Vec<String> = if compressed_cols_str.is_empty() {
+            Vec::new()
+        } else {
+            compressed_cols_str.split(',').map(|s| s.trim().to_string()).collect()
+        };
+
+        // Parse schema (format: "col1:TYPE1,col2:TYPE2,...")
+        let schema_str = std::str::from_utf8(args[5])
+            .map_err(|e| rusqlite::Error::ModuleError(format!("Invalid UTF-8: {}", e)))?;
+        let mut all_columns = Vec::new();
+        for col_def in schema_str.split(',') {
+            let parts: Vec<&str> = col_def.split(':').collect();
+            if parts.len() != 2 {
+                return Err(rusqlite::Error::ModuleError(format!(
+                    "Invalid column definition: {}",
+                    col_def
+                )));
+            }
+            all_columns.push((parts[0].trim().to_string(), parts[1].trim().to_string()));
+        }
 
         // Build schema DDL
         let schema = build_schema_ddl(&all_columns);
@@ -51,8 +91,8 @@ unsafe impl<'vtab> VTab<'vtab> for ZstdVTab {
         let vtab = ZstdVTab {
             base: sqlite3_vtab::default(),
             db_handle,
-            underlying_table: config.underlying_table.clone(),
-            compressed_columns: config.compressed_columns.clone(),
+            underlying_table,
+            compressed_columns,
             all_columns,
         };
 
@@ -262,9 +302,12 @@ fn build_schema_ddl(columns: &[(String, String)]) -> String {
     format!("CREATE TABLE x({})", col_defs.join(", "))
 }
 
-/// Register the zstd virtual table module with SQLite
-pub fn register_module(_conn: &Connection) -> Result<()> {
-    // TODO: Implement module registration
-    // This will be called from zstd_enable_impl
-    Ok(())
+/// Register the zstd virtual table module with SQLite.
+/// This only needs to be called once per connection.
+pub fn register_module(conn: &Connection) -> Result<()> {
+    // Get the module definition for writable virtual tables
+    let module = update_module::<ZstdVTab>();
+
+    // Register the module with the connection
+    conn.create_module("zstd", module, None)
 }

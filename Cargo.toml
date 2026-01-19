@@ -19,3 +19,8 @@ rusqlite = { version = "0.32", features = ["bundled", "functions", "vtab"] }
 
 [dev-dependencies]
 tempfile = "3"
+criterion = "0.5"
+
+[[bench]]
+name = "compression_bench"
+harness = false

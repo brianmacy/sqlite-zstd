@@ -50,9 +50,48 @@ INSERT OR ROLLBACK ...  -- Rollback entire transaction
 |---------------|---------------|---------|
 | `ON CONFLICT DO NOTHING` | `INSERT OR IGNORE` | ✅ Fully supported |
 | `ON CONFLICT REPLACE` | `INSERT OR REPLACE` | ✅ Fully supported |
-| `ON CONFLICT DO UPDATE` | No equivalent | ❌ Not available |
+| `ON CONFLICT DO UPDATE` | See workaround below | ❌ Not available |
+| `ON CONFLICT ... RETURNING` | Two statements | ❌ Not available |
 
 **Note:** `INSERT OR IGNORE` and `ON CONFLICT DO NOTHING` are functionally identical - both silently skip the insert if a conflict occurs. The only difference is syntax.
+
+### Workaround for ON CONFLICT DO UPDATE
+
+`ON CONFLICT DO UPDATE` allows partial row updates (only changing specific columns). Since `INSERT OR REPLACE` replaces the entire row, partial updates require application logic:
+
+**Pattern 1: Check-then-update (two statements)**
+```sql
+-- Try insert first, then update if it failed
+INSERT OR IGNORE INTO table (id, data, counter) VALUES (?, ?, 1);
+-- If insert was ignored (row exists), update specific columns
+UPDATE table SET data = ?, counter = counter + 1 WHERE id = ? AND changes() = 0;
+```
+
+**Pattern 2: Conditional with existing values**
+```sql
+-- First, try to get existing row
+SELECT counter FROM table WHERE id = ?;
+-- Then INSERT OR REPLACE with computed values
+INSERT OR REPLACE INTO table (id, data, counter) VALUES (?, ?, ?);
+```
+
+**Pattern 3: Use a transaction for atomicity**
+```sql
+BEGIN;
+INSERT OR IGNORE INTO table (id, data, counter) VALUES (?, ?, 1);
+UPDATE table SET counter = counter + 1 WHERE id = ? AND changes() = 0;
+COMMIT;
+```
+
+### Workaround for RETURNING Clause
+
+The `RETURNING` clause (SQLite 3.35.0+) cannot be combined with UPSERT on virtual tables. Use a separate SELECT:
+
+```sql
+-- Instead of: INSERT ... ON CONFLICT DO UPDATE ... RETURNING *
+INSERT OR REPLACE INTO table (id, data) VALUES (?, ?);
+SELECT * FROM table WHERE id = ?;
+```
 
 ### Impact
 

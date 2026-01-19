@@ -1,41 +1,22 @@
-# Prerequisites
-*.d
+# Rust build artifacts
+/target/
+Cargo.lock
 
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
+# Rustfmt backup files
+**/*.rs.bk
 
-# Precompiled Headers
-*.gch
-*.pch
+# IDE/editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
 
-# Linker files
-*.ilk
+# macOS
+.DS_Store
 
-# Debugger Files
-*.pdb
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
-
-# debug information files
-*.dwo
+# SQLite test databases
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

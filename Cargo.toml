@@ -1,0 +1,21 @@
+[package]
+name = "sqlite-zstd"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "SQLite extension for seamless TEXT field compression using Zstandard"
+repository = "https://github.com/brianmacy/sqlite-zstd"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+loadable_extension = ["rusqlite/loadable_extension"]
+
+[dependencies]
+zstd = "0.13"
+rusqlite = { version = "0.32", features = ["bundled", "functions", "vtab"] }
+
+[dev-dependencies]
+tempfile = "3"

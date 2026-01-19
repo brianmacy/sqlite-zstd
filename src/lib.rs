@@ -1,7 +1,7 @@
 //! SQLite extension for seamless TEXT field compression using Zstandard (zstd).
 //!
 //! This extension provides transparent compression/decompression of TEXT columns
-//! through a view/trigger mechanism.
+//! through a view/trigger mechanism with smart compression (marker byte protocol).
 
 use rusqlite::functions::FunctionFlags;
 use rusqlite::types::{ToSqlOutput, Value, ValueRef};
@@ -10,7 +10,9 @@ use rusqlite::{Connection, Result};
 #[cfg(feature = "loadable_extension")]
 use rusqlite::ffi;
 #[cfg(feature = "loadable_extension")]
-use std::os::raw::{c_char, c_int};
+use std::ffi::c_int;
+#[cfg(feature = "loadable_extension")]
+use std::os::raw::c_char;
 
 /// Default compression level (zstd range is 1-22, 3 is default)
 const DEFAULT_COMPRESSION_LEVEL: i32 = 3;
@@ -21,17 +23,81 @@ const CONFIG_TABLE: &str = "_zstd_config";
 /// Prefix for renamed tables
 const TABLE_PREFIX: &str = "_zstd_";
 
+/// Marker bytes for stored values
+const MARKER_RAW: u8 = 0x00;
+const MARKER_COMPRESSED: u8 = 0x01;
+
+/// Minimum size threshold for compression (bytes). Strings smaller than this
+/// are stored raw since compression overhead would outweigh benefits.
+const MIN_COMPRESS_SIZE: usize = 64;
+
 // =============================================================================
-// SQL Function Implementations
+// Compression/Decompression with Marker Byte
 // =============================================================================
 
-/// Compress text using zstd.
+/// Compress text if beneficial, prepending marker byte.
+/// Returns MARKER_RAW + raw bytes if compression isn't beneficial,
+/// or MARKER_COMPRESSED + compressed bytes otherwise.
+fn compress_with_marker(text: &str, level: i32) -> std::result::Result<Vec<u8>, String> {
+    let bytes = text.as_bytes();
+
+    // Skip compression for small strings
+    if bytes.len() < MIN_COMPRESS_SIZE {
+        let mut result = Vec::with_capacity(1 + bytes.len());
+        result.push(MARKER_RAW);
+        result.extend_from_slice(bytes);
+        return Ok(result);
+    }
+
+    // Try compression
+    let compressed =
+        zstd::encode_all(bytes, level).map_err(|e| format!("zstd compression failed: {}", e))?;
+
+    // Use compressed only if it's actually smaller (accounting for marker byte)
+    if compressed.len() < bytes.len() {
+        let mut result = Vec::with_capacity(1 + compressed.len());
+        result.push(MARKER_COMPRESSED);
+        result.extend_from_slice(&compressed);
+        Ok(result)
+    } else {
+        let mut result = Vec::with_capacity(1 + bytes.len());
+        result.push(MARKER_RAW);
+        result.extend_from_slice(bytes);
+        Ok(result)
+    }
+}
+
+/// Decompress data with marker byte.
+/// Handles both MARKER_RAW (returns as-is) and MARKER_COMPRESSED (decompresses).
+fn decompress_with_marker(data: &[u8]) -> std::result::Result<String, String> {
+    if data.is_empty() {
+        return Err("empty data".to_string());
+    }
+
+    match data[0] {
+        MARKER_RAW => String::from_utf8(data[1..].to_vec())
+            .map_err(|e| format!("invalid UTF-8 in raw data: {}", e)),
+        MARKER_COMPRESSED => {
+            let decompressed = zstd::decode_all(&data[1..])
+                .map_err(|e| format!("zstd decompression failed: {}", e))?;
+            String::from_utf8(decompressed)
+                .map_err(|e| format!("decompressed data is not valid UTF-8: {}", e))
+        }
+        marker => Err(format!("unknown marker byte: 0x{:02x}", marker)),
+    }
+}
+
+// =============================================================================
+// Low-level SQL Function Implementations (without marker byte)
+// =============================================================================
+
+/// Compress text using zstd (raw, no marker byte).
 /// SQL: zstd_compress(text) or zstd_compress(text, level)
 fn zstd_compress_impl(text: &str, level: i32) -> std::result::Result<Vec<u8>, String> {
     zstd::encode_all(text.as_bytes(), level).map_err(|e| format!("zstd compression failed: {}", e))
 }
 
-/// Decompress zstd-compressed blob back to text.
+/// Decompress zstd-compressed blob back to text (raw, no marker byte).
 /// SQL: zstd_decompress(blob)
 fn zstd_decompress_impl(data: &[u8]) -> std::result::Result<String, String> {
     let decompressed =
@@ -113,6 +179,10 @@ fn get_all_columns(
     Ok(columns)
 }
 
+// =============================================================================
+// Enable/Disable Functions
+// =============================================================================
+
 /// Enable compression for a table.
 fn zstd_enable_impl(
     conn: &Connection,
@@ -126,7 +196,7 @@ fn zstd_enable_impl(
 
     let raw_table = format!("{}{}", TABLE_PREFIX, table);
 
-    // Check if already enabled
+    // Check if already enabled (view exists with this name)
     let existing: Option<String> = conn
         .query_row(
             "SELECT name FROM sqlite_master WHERE type='view' AND name=?",
@@ -186,7 +256,7 @@ fn zstd_enable_impl(
         let mut select_list: Vec<String> = vec![format!("\"{}\".rowid AS rowid", raw_table)];
         select_list.extend(all_columns.iter().map(|(name, _)| {
             if compress_columns.contains(name) {
-                format!("zstd_decompress(\"{}\") AS \"{}\"", name, name)
+                format!("zstd_decompress_marked(\"{}\") AS \"{}\"", name, name)
             } else {
                 format!("\"{}\"", name)
             }
@@ -211,7 +281,7 @@ fn zstd_enable_impl(
             .iter()
             .map(|(name, _)| {
                 if compress_columns.contains(name) {
-                    format!("zstd_compress(NEW.\"{}\")", name)
+                    format!("zstd_compress_marked(NEW.\"{}\")", name)
                 } else {
                     format!("NEW.\"{}\"", name)
                 }
@@ -238,7 +308,7 @@ fn zstd_enable_impl(
             .iter()
             .map(|(name, _)| {
                 if compress_columns.contains(name) {
-                    format!("\"{}\" = zstd_compress(NEW.\"{}\")", name, name)
+                    format!("\"{}\" = zstd_compress_marked(NEW.\"{}\")", name, name)
                 } else {
                     format!("\"{}\" = NEW.\"{}\"", name, name)
                 }
@@ -374,7 +444,7 @@ fn zstd_disable_impl(
                 // Decompress the column in the raw table
                 conn.execute(
                     &format!(
-                        "UPDATE \"{}\" SET \"{}\" = zstd_decompress(\"{}\")",
+                        "UPDATE \"{}\" SET \"{}\" = zstd_decompress_marked(\"{}\")",
                         raw_table, col, col
                     ),
                     [],
@@ -435,7 +505,7 @@ fn zstd_disable_table(
     for col in &columns {
         conn.execute(
             &format!(
-                "UPDATE \"{}\" SET \"{}\" = zstd_decompress(\"{}\")",
+                "UPDATE \"{}\" SET \"{}\" = zstd_decompress_marked(\"{}\")",
                 raw_table, col, col
             ),
             [],
@@ -518,7 +588,7 @@ fn recreate_view_and_triggers(
     let mut select_list: Vec<String> = vec![format!("\"{}\".rowid AS rowid", raw_table)];
     select_list.extend(all_columns.iter().map(|(name, _)| {
         if compress_columns.contains(name) {
-            format!("zstd_decompress(\"{}\") AS \"{}\"", name, name)
+            format!("zstd_decompress_marked(\"{}\") AS \"{}\"", name, name)
         } else {
             format!("\"{}\"", name)
         }
@@ -542,7 +612,7 @@ fn recreate_view_and_triggers(
         .iter()
         .map(|(name, _)| {
             if compress_columns.contains(name) {
-                format!("zstd_compress(NEW.\"{}\")", name)
+                format!("zstd_compress_marked(NEW.\"{}\")", name)
             } else {
                 format!("NEW.\"{}\"", name)
             }
@@ -567,7 +637,7 @@ fn recreate_view_and_triggers(
         .iter()
         .map(|(name, _)| {
             if compress_columns.contains(name) {
-                format!("\"{}\" = zstd_compress(NEW.\"{}\")", name, name)
+                format!("\"{}\" = zstd_compress_marked(NEW.\"{}\")", name, name)
             } else {
                 format!("\"{}\" = NEW.\"{}\"", name, name)
             }
@@ -648,7 +718,7 @@ fn zstd_stats_impl(conn: &Connection, table: &str) -> std::result::Result<String
 
     let mut stats = Vec::new();
     for col in &columns {
-        // Get compressed size
+        // Get compressed size (includes marker byte)
         let compressed_size: i64 = conn
             .query_row(
                 &format!(
@@ -664,7 +734,7 @@ fn zstd_stats_impl(conn: &Connection, table: &str) -> std::result::Result<String
         let decompressed_size: i64 = conn
             .query_row(
                 &format!(
-                    "SELECT COALESCE(SUM(LENGTH(zstd_decompress(\"{}\"))), 0) FROM \"{}\"",
+                    "SELECT COALESCE(SUM(LENGTH(zstd_decompress_marked(\"{}\"))), 0) FROM \"{}\"",
                     col, raw_table
                 ),
                 [],
@@ -693,7 +763,7 @@ fn zstd_stats_impl(conn: &Connection, table: &str) -> std::result::Result<String
 
 /// Register all zstd functions with the SQLite connection.
 pub fn register_functions(conn: &Connection) -> Result<()> {
-    // zstd_compress(text) and zstd_compress(text, level)
+    // zstd_compress(text) and zstd_compress(text, level) - raw, no marker
     conn.create_scalar_function(
         "zstd_compress",
         -1,
@@ -731,7 +801,7 @@ pub fn register_functions(conn: &Connection) -> Result<()> {
         },
     )?;
 
-    // zstd_decompress(blob)
+    // zstd_decompress(blob) - raw, no marker
     conn.create_scalar_function(
         "zstd_decompress",
         1,
@@ -749,6 +819,61 @@ pub fn register_functions(conn: &Connection) -> Result<()> {
             };
 
             match zstd_decompress_impl(data) {
+                Ok(text) => Ok(ToSqlOutput::Owned(Value::Text(text))),
+                Err(e) => Err(rusqlite::Error::UserFunctionError(e.into())),
+            }
+        },
+    )?;
+
+    // zstd_compress_marked(text) - with marker byte, used internally
+    conn.create_scalar_function(
+        "zstd_compress_marked",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let text = ctx.get_raw(0);
+            let text = match text {
+                ValueRef::Text(s) => std::str::from_utf8(s)
+                    .map_err(|e| rusqlite::Error::UserFunctionError(e.to_string().into()))?,
+                ValueRef::Null => return Ok(ToSqlOutput::Owned(Value::Null)),
+                _ => {
+                    return Err(rusqlite::Error::UserFunctionError(
+                        "zstd_compress_marked: argument must be TEXT".into(),
+                    ));
+                }
+            };
+
+            match compress_with_marker(text, DEFAULT_COMPRESSION_LEVEL) {
+                Ok(compressed) => Ok(ToSqlOutput::Owned(Value::Blob(compressed))),
+                Err(e) => Err(rusqlite::Error::UserFunctionError(e.into())),
+            }
+        },
+    )?;
+
+    // zstd_decompress_marked(blob) - with marker byte, used internally
+    conn.create_scalar_function(
+        "zstd_decompress_marked",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let data = ctx.get_raw(0);
+            let data = match data {
+                ValueRef::Blob(b) => b,
+                ValueRef::Null => return Ok(ToSqlOutput::Owned(Value::Null)),
+                // If it's already text (not compressed), return as-is
+                ValueRef::Text(s) => {
+                    let text = std::str::from_utf8(s)
+                        .map_err(|e| rusqlite::Error::UserFunctionError(e.to_string().into()))?;
+                    return Ok(ToSqlOutput::Owned(Value::Text(text.to_string())));
+                }
+                _ => {
+                    return Err(rusqlite::Error::UserFunctionError(
+                        "zstd_decompress_marked: argument must be BLOB or TEXT".into(),
+                    ));
+                }
+            };
+
+            match decompress_with_marker(data) {
                 Ok(text) => Ok(ToSqlOutput::Owned(Value::Text(text))),
                 Err(e) => Err(rusqlite::Error::UserFunctionError(e.into())),
             }
@@ -834,21 +959,6 @@ pub fn register_functions(conn: &Connection) -> Result<()> {
             Err(e) => Err(rusqlite::Error::UserFunctionError(e.into())),
         }
     })?;
-
-    // zstd_raw(table, column) - simplified version
-    // Note: For efficient joins, query the _zstd_<table> directly.
-    conn.create_scalar_function(
-        "zstd_raw",
-        2,
-        FunctionFlags::SQLITE_UTF8,
-        |_ctx| -> std::result::Result<ToSqlOutput<'_>, rusqlite::Error> {
-            // This simplified implementation requires the user to query
-            // the raw table directly for efficient joins.
-            Err(rusqlite::Error::UserFunctionError(
-                "zstd_raw: for efficient joins, query the _zstd_<table> directly".into(),
-            ))
-        },
-    )?;
 
     Ok(())
 }
@@ -1023,6 +1133,69 @@ mod tests {
             row.get::<_, String>(0)
         });
         assert!(result.is_err(), "Decompressing invalid data should fail");
+    }
+
+    // -------------------------------------------------------------------------
+    // Marker byte compression tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_compress_marked_small_string() {
+        let conn = setup_test_db();
+        // Small string should be stored raw with marker byte
+        let result: Vec<u8> = conn
+            .query_row("SELECT zstd_compress_marked('Hi')", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(result[0], MARKER_RAW, "Small string should use raw marker");
+        assert_eq!(&result[1..], b"Hi", "Raw data should follow marker");
+    }
+
+    #[test]
+    fn test_compress_marked_large_string() {
+        let conn = setup_test_db();
+        // Large repetitive string should be compressed
+        let large_text = "x".repeat(1000);
+        let result: Vec<u8> = conn
+            .query_row("SELECT zstd_compress_marked(?)", [&large_text], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            result[0], MARKER_COMPRESSED,
+            "Large string should use compressed marker"
+        );
+        assert!(
+            result.len() < large_text.len(),
+            "Compressed size should be smaller"
+        );
+    }
+
+    #[test]
+    fn test_decompress_marked_roundtrip() {
+        let conn = setup_test_db();
+        // Test both small and large strings
+        for text in &["Hi", "Hello, World!", &"x".repeat(1000)] {
+            let result: String = conn
+                .query_row(
+                    "SELECT zstd_decompress_marked(zstd_compress_marked(?))",
+                    [text],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(&result, *text, "Roundtrip should preserve data");
+        }
+    }
+
+    #[test]
+    fn test_decompress_marked_handles_text() {
+        let conn = setup_test_db();
+        // If given TEXT instead of BLOB, should return as-is
+        let result: String = conn
+            .query_row("SELECT zstd_decompress_marked('Hello')", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(result, "Hello");
     }
 
     // -------------------------------------------------------------------------
@@ -1333,7 +1506,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // zstd_raw tests - simplified since full implementation requires rowid context
+    // Raw table equality join tests
     // -------------------------------------------------------------------------
 
     #[test]
@@ -1357,10 +1530,11 @@ mod tests {
         conn.query_row("SELECT zstd_enable('docs_b', 'content')", [], |_| Ok(()))
             .unwrap();
 
-        // Insert matching content
-        conn.execute("INSERT INTO docs_a (content) VALUES ('matching text')", [])
+        // Insert matching content (large enough to be compressed)
+        let matching_text = "matching text ".repeat(100);
+        conn.execute("INSERT INTO docs_a (content) VALUES (?)", [&matching_text])
             .unwrap();
-        conn.execute("INSERT INTO docs_b (content) VALUES ('matching text')", [])
+        conn.execute("INSERT INTO docs_b (content) VALUES (?)", [&matching_text])
             .unwrap();
 
         // Join using raw tables directly for efficient comparison
@@ -1466,5 +1640,81 @@ mod tests {
             compressed_high.len() <= compressed_low.len(),
             "Higher compression level should produce same or smaller output"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Small string fallback tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_small_string_not_compressed() {
+        let conn = setup_test_db();
+        conn.execute(
+            "CREATE TABLE documents (id INTEGER PRIMARY KEY, content TEXT)",
+            [],
+        )
+        .unwrap();
+
+        conn.query_row("SELECT zstd_enable('documents', 'content')", [], |_| Ok(()))
+            .unwrap();
+
+        // Insert small string
+        conn.execute("INSERT INTO documents (content) VALUES ('Hi')", [])
+            .unwrap();
+
+        // Check raw storage - should have MARKER_RAW
+        let raw_content: Vec<u8> = conn
+            .query_row("SELECT content FROM _zstd_documents", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(
+            raw_content[0], MARKER_RAW,
+            "Small string should be stored raw"
+        );
+        assert_eq!(&raw_content[1..], b"Hi", "Raw content should match");
+
+        // Verify roundtrip still works
+        let content: String = conn
+            .query_row("SELECT content FROM documents", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(content, "Hi");
+    }
+
+    #[test]
+    fn test_large_string_compressed() {
+        let conn = setup_test_db();
+        conn.execute(
+            "CREATE TABLE documents (id INTEGER PRIMARY KEY, content TEXT)",
+            [],
+        )
+        .unwrap();
+
+        conn.query_row("SELECT zstd_enable('documents', 'content')", [], |_| Ok(()))
+            .unwrap();
+
+        // Insert large repetitive string
+        let large_text = "x".repeat(1000);
+        conn.execute("INSERT INTO documents (content) VALUES (?)", [&large_text])
+            .unwrap();
+
+        // Check raw storage - should have MARKER_COMPRESSED
+        let raw_content: Vec<u8> = conn
+            .query_row("SELECT content FROM _zstd_documents", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(
+            raw_content[0], MARKER_COMPRESSED,
+            "Large string should be compressed"
+        );
+        assert!(
+            raw_content.len() < large_text.len(),
+            "Compressed size should be smaller"
+        );
+
+        // Verify roundtrip still works
+        let content: String = conn
+            .query_row("SELECT content FROM documents", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(content, large_text);
     }
 }

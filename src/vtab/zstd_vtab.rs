@@ -22,7 +22,7 @@ pub struct VTabConfig {
 #[repr(C)]
 pub struct ZstdVTab {
     base: sqlite3_vtab,
-    db_handle: *mut ffi::sqlite3,
+    pub(crate) db_handle: *mut ffi::sqlite3,
     pub underlying_table: String,
     pub compressed_columns: Vec<String>,
     pub all_columns: Vec<(String, String)>, // (name, type)

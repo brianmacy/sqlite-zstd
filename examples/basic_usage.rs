@@ -33,11 +33,10 @@ fn main() -> Result<()> {
 
     // Enable compression on content column only
     println!("2. Enabling zstd compression on 'content' column...");
-    let result: String = conn.query_row(
-        "SELECT zstd_enable('articles', 'content')",
-        [],
-        |row| row.get(0),
-    )?;
+    let result: String =
+        conn.query_row("SELECT zstd_enable('articles', 'content')", [], |row| {
+            row.get(0)
+        })?;
     println!("   ✓ {}\n", result);
 
     // Insert some sample data
@@ -56,22 +55,12 @@ fn main() -> Result<()> {
 
     conn.execute(
         "INSERT INTO articles (title, author, content, published_date) VALUES (?, ?, ?, ?)",
-        rusqlite::params![
-            "Advanced SQLite",
-            "Bob",
-            &large_content,
-            "2024-02-20"
-        ],
+        rusqlite::params!["Advanced SQLite", "Bob", &large_content, "2024-02-20"],
     )?;
 
     conn.execute(
         "INSERT INTO articles (title, author, content, published_date) VALUES (?, ?, ?, ?)",
-        rusqlite::params![
-            "Data Compression",
-            "Charlie",
-            &large_content,
-            "2024-03-10"
-        ],
+        rusqlite::params!["Data Compression", "Charlie", &large_content, "2024-03-10"],
     )?;
 
     println!("   ✓ Inserted 3 articles\n");
@@ -110,7 +99,8 @@ fn main() -> Result<()> {
 
     // List compressed columns
     println!("7. Introspection:");
-    let columns: String = conn.query_row("SELECT zstd_columns('articles')", [], |row| row.get(0))?;
+    let columns: String =
+        conn.query_row("SELECT zstd_columns('articles')", [], |row| row.get(0))?;
     println!("   Compressed columns: {}\n", columns);
 
     // Update a row
@@ -122,11 +112,10 @@ fn main() -> Result<()> {
     println!("   ✓ Article 1 updated\n");
 
     // Verify update worked
-    let updated: String = conn.query_row(
-        "SELECT content FROM articles WHERE id = 1",
-        [],
-        |row| row.get(0),
-    )?;
+    let updated: String =
+        conn.query_row("SELECT content FROM articles WHERE id = 1", [], |row| {
+            row.get(0)
+        })?;
     println!("   ✓ New content: {}\n", updated);
 
     println!("=== Example Complete ===");

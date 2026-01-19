@@ -50,11 +50,10 @@ fn main() -> Result<()> {
     )?;
     println!("   ✓ Replaced: key='config', value='updated value'");
 
-    let value: String = conn.query_row(
-        "SELECT value FROM cache WHERE key = 'config'",
-        [],
-        |row| row.get(0),
-    )?;
+    let value: String =
+        conn.query_row("SELECT value FROM cache WHERE key = 'config'", [], |row| {
+            row.get(0)
+        })?;
     println!("   ✓ Current value: '{}'\n", value);
 
     // INSERT OR IGNORE example
@@ -73,11 +72,10 @@ fn main() -> Result<()> {
     )?;
     println!("   ✓ Duplicate insert ignored (no error)");
 
-    let user: String = conn.query_row(
-        "SELECT value FROM cache WHERE key = 'user1'",
-        [],
-        |row| row.get(0),
-    )?;
+    let user: String =
+        conn.query_row("SELECT value FROM cache WHERE key = 'user1'", [], |row| {
+            row.get(0)
+        })?;
     println!("   ✓ Value unchanged: '{}' (not 'Bob')\n", user);
 
     // Count total rows

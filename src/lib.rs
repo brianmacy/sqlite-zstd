@@ -1623,11 +1623,8 @@ mod tests {
         conn.query_row("SELECT zstd_enable('docs', 'content')", [], |_| Ok(()))
             .unwrap();
 
-        conn.execute(
-            "INSERT INTO docs (id, content) VALUES (1, 'Test')",
-            [],
-        )
-        .unwrap();
+        conn.execute("INSERT INTO docs (id, content) VALUES (1, 'Test')", [])
+            .unwrap();
 
         // Query that matches nothing
         let count: i32 = conn

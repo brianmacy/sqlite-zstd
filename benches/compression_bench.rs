@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use rusqlite::Connection;
 
 fn setup_db() -> Connection {
@@ -39,14 +39,18 @@ fn benchmark_compression(c: &mut Criterion) {
             .query_row("SELECT zstd_compress(?)", [&text], |row| row.get(0))
             .unwrap();
 
-        group.bench_with_input(BenchmarkId::new("decompress", name), &compressed, |b, data| {
-            let conn = setup_db();
-            b.iter(|| {
-                let _: String = conn
-                    .query_row("SELECT zstd_decompress(?)", [data], |row| row.get(0))
-                    .unwrap();
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("decompress", name),
+            &compressed,
+            |b, data| {
+                let conn = setup_db();
+                b.iter(|| {
+                    let _: String = conn
+                        .query_row("SELECT zstd_decompress(?)", [data], |row| row.get(0))
+                        .unwrap();
+                });
+            },
+        );
     }
 
     group.finish();

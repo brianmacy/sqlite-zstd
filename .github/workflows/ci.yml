@@ -45,10 +45,10 @@ jobs:
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run tests
-        run: cargo test --all-features
+        run: cargo test
 
-      - name: Run tests (no default features)
-        run: cargo test --no-default-features
+      # Note: loadable_extension feature is only for building the extension,
+      # not for running tests. Tests use the bundled SQLite.
 
   lint:
     name: Linting

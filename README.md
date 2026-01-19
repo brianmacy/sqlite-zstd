@@ -180,14 +180,14 @@ This approach:
 
 ## ON CONFLICT Support
 
-The virtual table implementation supports all SQLite ON CONFLICT clauses:
+The virtual table implementation supports all **legacy** SQLite ON CONFLICT clauses:
 
 ```sql
 -- Replace existing row if there's a conflict
 INSERT OR REPLACE INTO documents (id, title, content)
 VALUES (1, 'Updated', 'New content');
 
--- Ignore the insert if there's a conflict
+-- Ignore the insert if there's a conflict (functionally identical to ON CONFLICT DO NOTHING)
 INSERT OR IGNORE INTO documents (id, title, content)
 VALUES (1, 'Will be ignored', 'If id=1 exists');
 
@@ -196,6 +196,8 @@ INSERT OR ABORT ...   -- Abort the current statement (default)
 INSERT OR FAIL ...    -- Continue after error
 INSERT OR ROLLBACK ...  -- Rollback the entire transaction
 ```
+
+**Note:** Modern UPSERT syntax (`INSERT ... ON CONFLICT DO NOTHING`) is not supported for virtual tables due to a SQLite limitation. Use `INSERT OR IGNORE` instead - they are functionally equivalent. See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for details.
 
 This was impossible with the previous view+triggers architecture and is a major advantage of virtual tables.
 

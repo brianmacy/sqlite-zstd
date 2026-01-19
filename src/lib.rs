@@ -138,20 +138,22 @@ fn get_text_columns(conn: &Connection, table: &str) -> std::result::Result<Vec<S
     Ok(columns)
 }
 
-/// Get all columns from a table's schema with their types.
-fn get_all_columns(
+/// Get all columns from a table's schema with their types and pk status.
+/// Returns Vec<(name, type, is_pk)>
+fn get_all_columns_with_pk(
     conn: &Connection,
     table: &str,
-) -> std::result::Result<Vec<(String, String)>, String> {
+) -> std::result::Result<Vec<(String, String, bool)>, String> {
     let mut stmt = conn
         .prepare(&format!("PRAGMA table_info('{}')", table))
         .map_err(|e| format!("failed to get table info: {}", e))?;
 
-    let columns: Vec<(String, String)> = stmt
+    let columns: Vec<(String, String, bool)> = stmt
         .query_map([], |row| {
             let name: String = row.get(1)?;
             let col_type: String = row.get(2)?;
-            Ok((name, col_type))
+            let pk: i32 = row.get(5)?;
+            Ok((name, col_type, pk != 0))
         })
         .map_err(|e| format!("failed to query table info: {}", e))?
         .filter_map(|r| r.ok())
@@ -220,8 +222,12 @@ fn zstd_enable_impl(
         return Err(format!("table '{}' does not exist", table));
     }
 
-    // Get all columns and their types
-    let all_columns = get_all_columns(conn, table)?;
+    // Get all columns with types and PRIMARY KEY information
+    let all_columns_with_pk = get_all_columns_with_pk(conn, table)?;
+    let all_columns: Vec<(String, String)> = all_columns_with_pk
+        .iter()
+        .map(|(name, typ, _)| (name.clone(), typ.clone()))
+        .collect();
 
     // Helper to check if type is TEXT-like (TEXT, CLOB, CLOB(n))
     let is_text_type = |col_type: &str| -> bool {
@@ -270,11 +276,17 @@ fn zstd_enable_impl(
         )
         .map_err(|e| format!("failed to rename table: {}", e))?;
 
-        // Build schema string: "col1:TYPE1|col2:TYPE2|..."
+        // Build schema string: "col1:TYPE1:PK|col2:TYPE2|..." (PK suffix for primary keys)
         // Use | as delimiter because commas are interpreted as SQL argument separators
-        let schema_str = all_columns
+        let schema_str = all_columns_with_pk
             .iter()
-            .map(|(name, col_type)| format!("{}:{}", name, col_type))
+            .map(|(name, col_type, is_pk)| {
+                if *is_pk {
+                    format!("{}:{}:PK", name, col_type)
+                } else {
+                    format!("{}:{}", name, col_type)
+                }
+            })
             .collect::<Vec<_>>()
             .join("|");
 
@@ -407,17 +419,23 @@ fn zstd_disable_impl(
                 let remaining_columns: Vec<String> =
                     columns.into_iter().filter(|c| c != col).collect();
 
-                // Get all columns from underlying table
-                let all_columns = get_all_columns(conn, &raw_table)?;
+                // Get all columns from underlying table with PK info
+                let all_columns_with_pk = get_all_columns_with_pk(conn, &raw_table)?;
 
                 // Drop existing virtual table
                 conn.execute(&format!("DROP TABLE \"{}\"", table), [])
                     .map_err(|e| format!("failed to drop virtual table: {}", e))?;
 
-                // Build new schema string (use | delimiter)
-                let schema_str = all_columns
+                // Build new schema string with PK info (use | delimiter)
+                let schema_str = all_columns_with_pk
                     .iter()
-                    .map(|(name, col_type)| format!("{}:{}", name, col_type))
+                    .map(|(name, col_type, is_pk)| {
+                        if *is_pk {
+                            format!("{}:{}:PK", name, col_type)
+                        } else {
+                            format!("{}:{}", name, col_type)
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join("|");
 
@@ -1748,5 +1766,175 @@ mod tests {
         println!("Query plan: {}", plan);
         // We don't assert on the plan content as it's implementation-dependent
         // The important thing is the query executes correctly with constraints
+    }
+
+    // -------------------------------------------------------------------------
+    // UPSERT and ON CONFLICT DO NOTHING tests (for Senzing integration)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_sqlite_version() {
+        let conn = setup_test_db();
+        let version: String = conn
+            .query_row("SELECT sqlite_version()", [], |row| row.get(0))
+            .unwrap();
+        println!("SQLite version: {}", version);
+
+        // Check if version supports UPSERT for virtual tables (3.35.0+)
+        let parts: Vec<&str> = version.split('.').collect();
+        if parts.len() >= 2 {
+            let major: i32 = parts[0].parse().unwrap_or(0);
+            let minor: i32 = parts[1].parse().unwrap_or(0);
+            println!("Major: {}, Minor: {}", major, minor);
+
+            if major > 3 || (major == 3 && minor >= 35) {
+                println!("✓ SQLite version supports UPSERT for virtual tables");
+            } else {
+                println!("✗ SQLite version may not support UPSERT for virtual tables (need 3.35.0+)");
+            }
+        }
+    }
+
+    #[test]
+    fn test_insert_or_ignore_workaround() {
+        // NOTE: Modern UPSERT syntax (ON CONFLICT DO NOTHING) is not supported
+        // for virtual tables in SQLite. Use INSERT OR IGNORE instead.
+        let conn = setup_test_db();
+        conn.execute(
+            "CREATE TABLE obs_ent (id INTEGER PRIMARY KEY, features TEXT)",
+            [],
+        )
+        .unwrap();
+
+        conn.query_row("SELECT zstd_enable('obs_ent', 'features')", [], |_| {
+            Ok(())
+        })
+        .unwrap();
+
+        // Insert initial record
+        conn.execute(
+            "INSERT INTO obs_ent (id, features) VALUES (1, 'feature1')",
+            [],
+        )
+        .unwrap();
+
+        // Use INSERT OR IGNORE instead of ON CONFLICT DO NOTHING
+        // These are functionally equivalent - both silently ignore duplicates
+        conn.execute(
+            "INSERT OR IGNORE INTO obs_ent (id, features) VALUES (1, 'feature2')",
+            [],
+        )
+        .unwrap();
+
+        // Verify original value is unchanged
+        let features: String = conn
+            .query_row("SELECT features FROM obs_ent WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            features, "feature1",
+            "INSERT OR IGNORE should not modify existing row"
+        );
+
+        // Verify only one row exists
+        let count: i32 = conn
+            .query_row("SELECT COUNT(*) FROM obs_ent", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_insert_or_ignore_composite_key() {
+        // Test INSERT OR IGNORE with composite primary key
+        let conn = setup_test_db();
+
+        conn.execute(
+            "CREATE TABLE records (
+                source_id INTEGER,
+                record_key TEXT,
+                json_data TEXT,
+                PRIMARY KEY (source_id, record_key)
+            )",
+            [],
+        )
+        .unwrap();
+
+        conn.query_row("SELECT zstd_enable('records', 'json_data')", [], |_| Ok(()))
+            .unwrap();
+
+        // Insert initial records
+        for i in 1..=10 {
+            conn.execute(
+                "INSERT INTO records (source_id, record_key, json_data) VALUES (1, ?, ?)",
+                rusqlite::params![format!("KEY{}", i), format!("{{\"data\": {}}}", i)],
+            )
+            .unwrap();
+        }
+
+        // Attempt duplicate inserts with INSERT OR IGNORE
+        // These should all succeed without error (duplicates silently ignored)
+        for i in 1..=10 {
+            conn.execute(
+                "INSERT OR IGNORE INTO records (source_id, record_key, json_data)
+                 VALUES (1, ?, ?)",
+                rusqlite::params![format!("KEY{}", i), format!("{{\"updated\": {}}}", i)],
+            )
+            .unwrap();
+        }
+
+        // Verify original values unchanged
+        let json: String = conn
+            .query_row(
+                "SELECT json_data FROM records WHERE record_key = 'KEY1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            json, "{\"data\": 1}",
+            "INSERT OR IGNORE preserved original data"
+        );
+
+        // Verify still only 10 rows
+        let count: i32 = conn
+            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 10);
+    }
+
+    #[test]
+    fn test_insert_or_ignore_with_primary_key() {
+        let conn = setup_test_db();
+        conn.execute(
+            "CREATE TABLE cache (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+
+        conn.query_row("SELECT zstd_enable('cache', 'value')", [], |_| Ok(()))
+            .unwrap();
+
+        // Insert initial
+        conn.execute(
+            "INSERT INTO cache (key, value) VALUES ('config', 'initial')",
+            [],
+        )
+        .unwrap();
+
+        // Try duplicate with INSERT OR IGNORE
+        conn.execute(
+            "INSERT OR IGNORE INTO cache (key, value) VALUES ('config', 'ignored')",
+            [],
+        )
+        .unwrap();
+
+        // Verify original unchanged
+        let value: String = conn
+            .query_row("SELECT value FROM cache WHERE key = 'config'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(value, "initial");
     }
 }

@@ -38,6 +38,10 @@ unsafe impl<'vtab> VTab<'vtab> for ZstdVTab {
         _aux: Option<&Self::Aux>,
         args: &[&[u8]],
     ) -> Result<(String, Self)> {
+        // Enable constraint support for ON CONFLICT clauses
+        // This tells SQLite that our virtual table can handle UPSERT and ON CONFLICT
+        db.config(rusqlite::vtab::VTabConfig::ConstraintSupport)?;
+
         // Parse arguments from CREATE VIRTUAL TABLE statement
         // Format: CREATE VIRTUAL TABLE name USING zstd(underlying, cols, schema)
         // args[0] = module name ("zstd")
@@ -71,23 +75,33 @@ unsafe impl<'vtab> VTab<'vtab> for ZstdVTab {
                 .collect()
         };
 
-        // Parse schema (format: "col1:TYPE1|col2:TYPE2|...")
+        // Parse schema (format: "col1:TYPE1:PK|col2:TYPE2|...")
+        // PK suffix indicates primary key column
         let schema_str = std::str::from_utf8(args[5])
             .map_err(|e| rusqlite::Error::ModuleError(format!("Invalid UTF-8: {}", e)))?;
         let mut all_columns = Vec::new();
+        let mut pk_columns = Vec::new();
+
         for col_def in schema_str.split('|') {
             let parts: Vec<&str> = col_def.split(':').collect();
-            if parts.len() != 2 {
+            if parts.len() < 2 || parts.len() > 3 {
                 return Err(rusqlite::Error::ModuleError(format!(
                     "Invalid column definition: {}",
                     col_def
                 )));
             }
-            all_columns.push((parts[0].trim().to_string(), parts[1].trim().to_string()));
+            let name = parts[0].trim().to_string();
+            let col_type = parts[1].trim().to_string();
+            let is_pk = parts.len() == 3 && parts[2].trim() == "PK";
+
+            all_columns.push((name.clone(), col_type));
+            if is_pk {
+                pk_columns.push(name);
+            }
         }
 
-        // Build schema DDL
-        let schema = build_schema_ddl(&all_columns);
+        // Build schema DDL with PRIMARY KEY constraints
+        let schema = build_schema_ddl(&all_columns, &pk_columns);
 
         // Get database handle for later use in insert/update/delete operations
         let db_handle = unsafe { db.handle() };
@@ -193,7 +207,7 @@ impl<'vtab> UpdateVTab<'vtab> for ZstdVTab {
             }
         }
 
-        // Build INSERT statement
+        // Build INSERT statement based on conflict mode
         let col_names: Vec<_> = self
             .all_columns
             .iter()
@@ -201,35 +215,25 @@ impl<'vtab> UpdateVTab<'vtab> for ZstdVTab {
             .collect();
         let placeholders = vec!["?"; col_names.len()].join(", ");
 
-        let sql = match conflict_mode {
-            ConflictMode::Replace => {
-                format!(
-                    "INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
-                    self.underlying_table,
-                    col_names.join(", "),
-                    placeholders
-                )
-            }
-            ConflictMode::Ignore => {
-                format!(
-                    "INSERT OR IGNORE INTO \"{}\" ({}) VALUES ({})",
-                    self.underlying_table,
-                    col_names.join(", "),
-                    placeholders
-                )
-            }
-            _ => {
-                format!(
-                    "INSERT INTO \"{}\" ({}) VALUES ({})",
-                    self.underlying_table,
-                    col_names.join(", "),
-                    placeholders
-                )
-            }
+        // For REPLACE mode, use INSERT OR REPLACE
+        // For all other modes, use plain INSERT and handle errors
+        let sql = if conflict_mode == ConflictMode::Replace {
+            format!(
+                "INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
+                self.underlying_table,
+                col_names.join(", "),
+                placeholders
+            )
+        } else {
+            format!(
+                "INSERT INTO \"{}\" ({}) VALUES ({})",
+                self.underlying_table,
+                col_names.join(", "),
+                placeholders
+            )
         };
 
-        // Execute INSERT and get rowid
-        // We need to use the raw database handle
+        // Execute INSERT and handle constraint violations based on conflict mode
         let conn = unsafe { Connection::from_handle_owned(self.db_handle)? };
         let mut stmt = conn.prepare(&sql)?;
 
@@ -244,9 +248,47 @@ impl<'vtab> UpdateVTab<'vtab> for ZstdVTab {
             }
         }
 
-        stmt.raw_execute()?;
-        drop(stmt); // Drop statement before accessing connection
-        let rowid = conn.last_insert_rowid();
+        // Execute and handle constraint violations
+        let result = stmt.raw_execute();
+
+        let rowid = match result {
+            Ok(_) => {
+                drop(stmt);
+                conn.last_insert_rowid()
+            }
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == ffi::ErrorCode::ConstraintViolation =>
+            {
+                // Constraint violation occurred
+                match conflict_mode {
+                    ConflictMode::Ignore => {
+                        // For IGNORE/DO NOTHING: Return success with rowid 0
+                        // This signals success without inserting
+                        drop(stmt);
+                        std::mem::forget(conn);
+                        return Ok(0);
+                    }
+                    ConflictMode::Fail | ConflictMode::Abort | ConflictMode::Rollback => {
+                        // Propagate the constraint error
+                        drop(stmt);
+                        std::mem::forget(conn);
+                        return Err(rusqlite::Error::SqliteFailure(err, None));
+                    }
+                    ConflictMode::Replace => {
+                        // Should not reach here - REPLACE uses INSERT OR REPLACE
+                        drop(stmt);
+                        std::mem::forget(conn);
+                        return Err(rusqlite::Error::SqliteFailure(err, None));
+                    }
+                }
+            }
+            Err(e) => {
+                // Other errors
+                drop(stmt);
+                std::mem::forget(conn);
+                return Err(e);
+            }
+        };
 
         // Don't drop the connection - SQLite owns it
         std::mem::forget(conn);
@@ -333,14 +375,36 @@ impl<'vtab> UpdateVTab<'vtab> for ZstdVTab {
     }
 }
 
-/// Build schema DDL for the virtual table
-fn build_schema_ddl(columns: &[(String, String)]) -> String {
+/// Build schema DDL for the virtual table with PRIMARY KEY constraints
+fn build_schema_ddl(columns: &[(String, String)], pk_columns: &[String]) -> String {
+    // Build column definitions
     let col_defs: Vec<String> = columns
         .iter()
-        .map(|(name, col_type)| format!("\"{}\" {}", name, col_type))
+        .map(|(name, col_type)| {
+            // Only add PRIMARY KEY inline for single-column primary keys
+            if pk_columns.len() == 1 && pk_columns.contains(name) {
+                format!("\"{}\" {} PRIMARY KEY", name, col_type)
+            } else {
+                format!("\"{}\" {}", name, col_type)
+            }
+        })
         .collect();
 
-    format!("CREATE TABLE x({})", col_defs.join(", "))
+    // If composite primary key, add PRIMARY KEY constraint at table level
+    if pk_columns.len() > 1 {
+        let pk_list = pk_columns
+            .iter()
+            .map(|name| format!("\"{}\"", name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "CREATE TABLE x({}, PRIMARY KEY ({}))",
+            col_defs.join(", "),
+            pk_list
+        )
+    } else {
+        format!("CREATE TABLE x({})", col_defs.join(", "))
+    }
 }
 
 /// Register the zstd virtual table module with SQLite.

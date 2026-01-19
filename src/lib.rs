@@ -1790,7 +1790,9 @@ mod tests {
             if major > 3 || (major == 3 && minor >= 35) {
                 println!("✓ SQLite version supports UPSERT for virtual tables");
             } else {
-                println!("✗ SQLite version may not support UPSERT for virtual tables (need 3.35.0+)");
+                println!(
+                    "✗ SQLite version may not support UPSERT for virtual tables (need 3.35.0+)"
+                );
             }
         }
     }
@@ -1806,10 +1808,8 @@ mod tests {
         )
         .unwrap();
 
-        conn.query_row("SELECT zstd_enable('obs_ent', 'features')", [], |_| {
-            Ok(())
-        })
-        .unwrap();
+        conn.query_row("SELECT zstd_enable('obs_ent', 'features')", [], |_| Ok(()))
+            .unwrap();
 
         // Insert initial record
         conn.execute(
@@ -1906,11 +1906,8 @@ mod tests {
     #[test]
     fn test_insert_or_ignore_with_primary_key() {
         let conn = setup_test_db();
-        conn.execute(
-            "CREATE TABLE cache (key TEXT PRIMARY KEY, value TEXT)",
-            [],
-        )
-        .unwrap();
+        conn.execute("CREATE TABLE cache (key TEXT PRIMARY KEY, value TEXT)", [])
+            .unwrap();
 
         conn.query_row("SELECT zstd_enable('cache', 'value')", [], |_| Ok(()))
             .unwrap();

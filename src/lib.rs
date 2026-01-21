@@ -1934,4 +1934,475 @@ mod tests {
             .unwrap();
         assert_eq!(value, "initial");
     }
+
+    // -------------------------------------------------------------------------
+    // WITHOUT ROWID table tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_without_rowid_basic_insert_select() {
+        let conn = setup_test_db();
+
+        // Create a WITHOUT ROWID table with TEXT primary key
+        conn.execute(
+            "CREATE TABLE kv_store (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            ) WITHOUT ROWID",
+            [],
+        )
+        .unwrap();
+
+        conn.query_row("SELECT zstd_enable('kv_store', 'value')", [], |_| Ok(()))
+            .unwrap();
+
+        // Insert data
+        conn.execute(
+            "INSERT INTO kv_store (key, value) VALUES ('config', 'some configuration data')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO kv_store (key, value) VALUES ('settings', 'user settings')",
+            [],
+        )
+        .unwrap();
+
+        // Verify select works
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM kv_store WHERE key = 'config'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "some configuration data");
+
+        // Verify count
+        let count: i32 = conn
+            .query_row("SELECT COUNT(*) FROM kv_store", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_without_rowid_update() {
+        let conn = setup_test_db();
+
+        conn.execute(
+            "CREATE TABLE kv_store (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            ) WITHOUT ROWID",
+            [],
+        )
+        .unwrap();
+
+        conn.query_row("SELECT zstd_enable('kv_store', 'value')", [], |_| Ok(()))
+            .unwrap();
+
+        // Insert initial data
+        conn.execute(
+            "INSERT INTO kv_store (key, value) VALUES ('test_key', 'original value')",
+            [],
+        )
+        .unwrap();
+
+        // Update the value
+        conn.execute(
+            "UPDATE kv_store SET value = 'updated value' WHERE key = 'test_key'",
+            [],
+        )
+        .unwrap();
+
+        // Verify update worked
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM kv_store WHERE key = 'test_key'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "updated value");
+    }
+
+    #[test]
+    fn test_without_rowid_delete() {
+        let conn = setup_test_db();
+
+        conn.execute(
+            "CREATE TABLE kv_store (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            ) WITHOUT ROWID",
+            [],
+        )
+        .unwrap();
+
+        conn.query_row("SELECT zstd_enable('kv_store', 'value')", [], |_| Ok(()))
+            .unwrap();
+
+        // Insert data
+        conn.execute(
+            "INSERT INTO kv_store (key, value) VALUES ('to_delete', 'will be deleted')",
+            [],
+        )
+        .unwrap();
+
+        // Delete
+        conn.execute("DELETE FROM kv_store WHERE key = 'to_delete'", [])
+            .unwrap();
+
+        // Verify deletion
+        let count: i32 = conn
+            .query_row("SELECT COUNT(*) FROM kv_store", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_without_rowid_composite_key() {
+        let conn = setup_test_db();
+
+        // Create WITHOUT ROWID table with composite primary key
+        conn.execute(
+            "CREATE TABLE metrics (
+                source TEXT,
+                metric_name TEXT,
+                value TEXT,
+                PRIMARY KEY (source, metric_name)
+            ) WITHOUT ROWID",
+            [],
+        )
+        .unwrap();
+
+        conn.query_row("SELECT zstd_enable('metrics', 'value')", [], |_| Ok(()))
+            .unwrap();
+
+        // Insert data with composite keys
+        conn.execute(
+            "INSERT INTO metrics (source, metric_name, value) VALUES ('server1', 'cpu', '45%')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO metrics (source, metric_name, value) VALUES ('server1', 'memory', '8GB')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO metrics (source, metric_name, value) VALUES ('server2', 'cpu', '60%')",
+            [],
+        )
+        .unwrap();
+
+        // Verify select with composite key
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM metrics WHERE source = 'server1' AND metric_name = 'cpu'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "45%");
+
+        // Verify count
+        let count: i32 = conn
+            .query_row("SELECT COUNT(*) FROM metrics", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn test_without_rowid_composite_key_update() {
+        let conn = setup_test_db();
+
+        conn.execute(
+            "CREATE TABLE metrics (
+                source TEXT,
+                metric_name TEXT,
+                value TEXT,
+                PRIMARY KEY (source, metric_name)
+            ) WITHOUT ROWID",
+            [],
+        )
+        .unwrap();
+
+        conn.query_row("SELECT zstd_enable('metrics', 'value')", [], |_| Ok(()))
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO metrics (source, metric_name, value) VALUES ('server1', 'cpu', '45%')",
+            [],
+        )
+        .unwrap();
+
+        // Update with composite key
+        conn.execute(
+            "UPDATE metrics SET value = '95%' WHERE source = 'server1' AND metric_name = 'cpu'",
+            [],
+        )
+        .unwrap();
+
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM metrics WHERE source = 'server1' AND metric_name = 'cpu'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "95%");
+    }
+
+    #[test]
+    fn test_without_rowid_insert_or_ignore() {
+        let conn = setup_test_db();
+
+        conn.execute(
+            "CREATE TABLE kv_store (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            ) WITHOUT ROWID",
+            [],
+        )
+        .unwrap();
+
+        conn.query_row("SELECT zstd_enable('kv_store', 'value')", [], |_| Ok(()))
+            .unwrap();
+
+        // Insert initial value
+        conn.execute(
+            "INSERT INTO kv_store (key, value) VALUES ('config', 'original')",
+            [],
+        )
+        .unwrap();
+
+        // Try to insert duplicate - should be ignored
+        conn.execute(
+            "INSERT OR IGNORE INTO kv_store (key, value) VALUES ('config', 'duplicate')",
+            [],
+        )
+        .unwrap();
+
+        // Verify original value preserved
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM kv_store WHERE key = 'config'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "original");
+
+        // Verify only one row
+        let count: i32 = conn
+            .query_row("SELECT COUNT(*) FROM kv_store", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_without_rowid_insert_or_replace() {
+        let conn = setup_test_db();
+
+        conn.execute(
+            "CREATE TABLE kv_store (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            ) WITHOUT ROWID",
+            [],
+        )
+        .unwrap();
+
+        conn.query_row("SELECT zstd_enable('kv_store', 'value')", [], |_| Ok(()))
+            .unwrap();
+
+        // Insert initial value
+        conn.execute(
+            "INSERT INTO kv_store (key, value) VALUES ('config', 'original')",
+            [],
+        )
+        .unwrap();
+
+        // Replace with new value
+        conn.execute(
+            "INSERT OR REPLACE INTO kv_store (key, value) VALUES ('config', 'replaced')",
+            [],
+        )
+        .unwrap();
+
+        // Verify value was replaced
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM kv_store WHERE key = 'config'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "replaced");
+
+        // Verify still only one row
+        let count: i32 = conn
+            .query_row("SELECT COUNT(*) FROM kv_store", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_without_rowid_integer_pk() {
+        let conn = setup_test_db();
+
+        // WITHOUT ROWID with INTEGER PRIMARY KEY (NOT an alias for rowid)
+        conn.execute(
+            "CREATE TABLE items (
+                id INTEGER PRIMARY KEY,
+                data TEXT
+            ) WITHOUT ROWID",
+            [],
+        )
+        .unwrap();
+
+        conn.query_row("SELECT zstd_enable('items', 'data')", [], |_| Ok(()))
+            .unwrap();
+
+        // Insert data
+        conn.execute("INSERT INTO items (id, data) VALUES (100, 'item 100')", [])
+            .unwrap();
+        conn.execute("INSERT INTO items (id, data) VALUES (200, 'item 200')", [])
+            .unwrap();
+
+        // Verify select
+        let data: String = conn
+            .query_row("SELECT data FROM items WHERE id = 100", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(data, "item 100");
+
+        // Verify update
+        conn.execute("UPDATE items SET data = 'updated 100' WHERE id = 100", [])
+            .unwrap();
+
+        let data: String = conn
+            .query_row("SELECT data FROM items WHERE id = 100", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(data, "updated 100");
+
+        // Verify delete
+        conn.execute("DELETE FROM items WHERE id = 100", [])
+            .unwrap();
+
+        let count: i32 = conn
+            .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_without_rowid_large_compressed_value() {
+        let conn = setup_test_db();
+
+        conn.execute(
+            "CREATE TABLE documents (
+                doc_id TEXT PRIMARY KEY,
+                content TEXT
+            ) WITHOUT ROWID",
+            [],
+        )
+        .unwrap();
+
+        conn.query_row("SELECT zstd_enable('documents', 'content')", [], |_| Ok(()))
+            .unwrap();
+
+        // Insert large content that will be compressed
+        let large_content = "x".repeat(10_000);
+        conn.execute(
+            "INSERT INTO documents (doc_id, content) VALUES ('doc1', ?)",
+            [&large_content],
+        )
+        .unwrap();
+
+        // Verify roundtrip
+        let content: String = conn
+            .query_row(
+                "SELECT content FROM documents WHERE doc_id = 'doc1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, large_content);
+
+        // Verify compression happened (check raw table)
+        let raw_content: Vec<u8> = conn
+            .query_row("SELECT content FROM _zstd_documents", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            raw_content[0], MARKER_COMPRESSED,
+            "Large content should be compressed"
+        );
+        assert!(
+            raw_content.len() < large_content.len(),
+            "Compressed size should be smaller"
+        );
+    }
+
+    #[test]
+    fn test_without_rowid_multiple_text_columns() {
+        let conn = setup_test_db();
+
+        conn.execute(
+            "CREATE TABLE records (
+                id TEXT PRIMARY KEY,
+                field1 TEXT,
+                field2 TEXT,
+                field3 TEXT
+            ) WITHOUT ROWID",
+            [],
+        )
+        .unwrap();
+
+        // Enable compression on multiple columns
+        conn.query_row(
+            "SELECT zstd_enable('records', 'field1', 'field2', 'field3')",
+            [],
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        // Insert data
+        conn.execute(
+            "INSERT INTO records (id, field1, field2, field3) VALUES ('rec1', 'value1', 'value2', 'value3')",
+            [],
+        )
+        .unwrap();
+
+        // Verify all fields roundtrip correctly
+        let (f1, f2, f3): (String, String, String) = conn
+            .query_row(
+                "SELECT field1, field2, field3 FROM records WHERE id = 'rec1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(f1, "value1");
+        assert_eq!(f2, "value2");
+        assert_eq!(f3, "value3");
+
+        // Update one field
+        conn.execute(
+            "UPDATE records SET field2 = 'updated2' WHERE id = 'rec1'",
+            [],
+        )
+        .unwrap();
+
+        let f2_updated: String = conn
+            .query_row("SELECT field2 FROM records WHERE id = 'rec1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(f2_updated, "updated2");
+    }
 }

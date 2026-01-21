@@ -2,6 +2,9 @@
 //!
 //! Supports both regular rowid tables and WITHOUT ROWID tables.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use rusqlite::ffi;
 use rusqlite::types::{Value, ValueRef};
 use rusqlite::vtab::{
@@ -31,6 +34,10 @@ pub struct ZstdVTab {
     pub all_columns: Vec<(String, String)>, // (name, type)
     pub pk_columns: Vec<String>,            // Primary key column names
     pub is_without_rowid: bool,             // Whether underlying table is WITHOUT ROWID
+    /// Cache mapping synthetic rowid to actual PK values for WITHOUT ROWID tables
+    /// This is needed because cursors return synthetic rowids for non-integer PKs,
+    /// but xUpdate needs the actual PK values for DELETE/UPDATE operations
+    pub(crate) pk_value_cache: Mutex<HashMap<i64, Vec<Value>>>,
 }
 
 /// Check if a table is WITHOUT ROWID by attempting to select rowid
@@ -154,6 +161,7 @@ unsafe impl<'vtab> VTab<'vtab> for ZstdVTab {
             all_columns,
             pk_columns,
             is_without_rowid,
+            pk_value_cache: Mutex::new(HashMap::new()),
         };
 
         Ok((schema, vtab))
@@ -348,8 +356,42 @@ impl<'vtab> UpdateVTab<'vtab> for ZstdVTab {
 
         if self.is_without_rowid {
             // For WITHOUT ROWID tables, we need to use PK columns
-            // The arg contains the first PK column value (for single-column PK)
-            // or we need to handle composite keys differently
+            // Check if we have cached PK values (for non-integer PKs with synthetic rowid)
+            if let ValueRef::Integer(synthetic_rowid) = arg
+                && let Ok(cache) = self.pk_value_cache.lock()
+                && let Some(pk_values) = cache.get(&synthetic_rowid)
+            {
+                // We have cached PK values - use them for DELETE
+                let where_clauses: Vec<String> = self
+                    .pk_columns
+                    .iter()
+                    .map(|pk| format!("\"{}\" = ?", pk))
+                    .collect();
+
+                let sql = format!(
+                    "DELETE FROM \"{}\" WHERE {}",
+                    self.underlying_table,
+                    where_clauses.join(" AND ")
+                );
+
+                let mut stmt = conn.prepare(&sql)?;
+                for (i, value) in pk_values.iter().enumerate() {
+                    match value {
+                        Value::Null => stmt.raw_bind_parameter(i + 1, value)?,
+                        Value::Integer(n) => stmt.raw_bind_parameter(i + 1, n)?,
+                        Value::Real(f) => stmt.raw_bind_parameter(i + 1, f)?,
+                        Value::Text(s) => stmt.raw_bind_parameter(i + 1, s)?,
+                        Value::Blob(b) => stmt.raw_bind_parameter(i + 1, b)?,
+                    }
+                }
+                stmt.raw_execute()?;
+                drop(stmt);
+                drop(cache);
+                std::mem::forget(conn);
+                return Ok(());
+            }
+
+            // Fallback: use the arg directly as the PK value (for integer PKs)
             if self.pk_columns.len() == 1 {
                 // Single-column PK
                 let pk_col = &self.pk_columns[0];
@@ -371,14 +413,13 @@ impl<'vtab> UpdateVTab<'vtab> for ZstdVTab {
                     ValueRef::Null => {
                         return Err(rusqlite::Error::ModuleError(
                             "Cannot delete with NULL primary key".to_string(),
-                        ))
+                        ));
                     }
                 };
             } else {
-                // Composite PK - more complex handling needed
-                // For now, return an error - this needs cursor state tracking
+                // Composite PK without cached values - need cursor state
                 return Err(rusqlite::Error::ModuleError(
-                    "DELETE on WITHOUT ROWID table with composite primary key requires cursor state tracking (not yet implemented)".to_string(),
+                    "DELETE on WITHOUT ROWID table with composite primary key requires cursor state tracking".to_string(),
                 ));
             }
         } else {
@@ -425,11 +466,28 @@ impl<'vtab> UpdateVTab<'vtab> for ZstdVTab {
 
         if self.is_without_rowid {
             // For WITHOUT ROWID tables, use PK columns in WHERE clause
+            // First check if we have cached PK values (for non-integer PKs with synthetic rowid)
+            let synthetic_rowid: i64 = args.get(0)?;
+            let cached_pk_values = self
+                .pk_value_cache
+                .lock()
+                .ok()
+                .and_then(|cache| cache.get(&synthetic_rowid).cloned());
+
             if self.pk_columns.len() == 1 {
                 // Single-column PK
                 let pk_col = &self.pk_columns[0];
-                let old_pk: Value = args.get(0)?;
-                values.push(old_pk);
+
+                // Determine the actual PK value to use for WHERE clause
+                let where_pk_value = if let Some(ref cached) = cached_pk_values {
+                    // Use cached PK value (for text/blob PKs)
+                    cached[0].clone()
+                } else {
+                    // Use the rowid directly (for integer PKs, it IS the PK value)
+                    Value::Integer(synthetic_rowid)
+                };
+
+                values.push(where_pk_value);
 
                 let sql = format!(
                     "UPDATE \"{}\" SET {} WHERE \"{}\" = ?",
@@ -477,10 +535,7 @@ impl<'vtab> UpdateVTab<'vtab> for ZstdVTab {
                 // Collect PK values from the new column values (args[2..])
                 let mut pk_values = Vec::new();
                 for pk_col in &self.pk_columns {
-                    if let Some(idx) = self
-                        .all_columns
-                        .iter()
-                        .position(|(name, _)| name == pk_col)
+                    if let Some(idx) = self.all_columns.iter().position(|(name, _)| name == pk_col)
                     {
                         let val: Value = args.get(idx + 2)?;
                         pk_values.push(val);

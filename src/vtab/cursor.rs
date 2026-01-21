@@ -1,4 +1,6 @@
 //! Cursor implementation for zstd virtual table.
+//!
+//! Supports both regular rowid tables and WITHOUT ROWID tables.
 
 use rusqlite::Result;
 use rusqlite::ffi;
@@ -16,6 +18,7 @@ pub struct ZstdCursor<'vtab> {
     vtab: &'vtab ZstdVTab,
     stmt: Option<*mut ffi::sqlite3_stmt>,
     current_rowid: i64,
+    row_counter: i64, // Used for synthetic rowid in WITHOUT ROWID tables
     eof: bool,
     _phantom: PhantomData<&'vtab ZstdVTab>,
 }
@@ -27,6 +30,7 @@ impl<'vtab> ZstdCursor<'vtab> {
             vtab,
             stmt: None,
             current_rowid: 0,
+            row_counter: 0,
             eof: true,
             _phantom: PhantomData,
         })
@@ -58,16 +62,31 @@ unsafe impl VTabCursor for ZstdCursor<'_> {
             }
         }
 
+        // Reset row counter
+        self.row_counter = 0;
+
         // Build SELECT query with optional WHERE clause
-        let col_list = std::iter::once("rowid".to_string())
-            .chain(
-                self.vtab
-                    .all_columns
-                    .iter()
-                    .map(|(name, _)| format!("\"{}\"", name)),
-            )
-            .collect::<Vec<_>>()
-            .join(", ");
+        // For WITHOUT ROWID tables, don't include rowid in the select list
+        let col_list = if self.vtab.is_without_rowid {
+            // Just select the actual columns, no rowid
+            self.vtab
+                .all_columns
+                .iter()
+                .map(|(name, _)| format!("\"{}\"", name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            // Include rowid as first column
+            std::iter::once("rowid".to_string())
+                .chain(
+                    self.vtab
+                        .all_columns
+                        .iter()
+                        .map(|(name, _)| format!("\"{}\"", name)),
+                )
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
 
         // Build WHERE clause based on idx_num bitmask
         let mut where_clauses = Vec::new();
@@ -185,8 +204,35 @@ unsafe impl VTabCursor for ZstdCursor<'_> {
 
             match rc {
                 ffi::SQLITE_ROW => {
-                    // Read rowid (first column)
-                    self.current_rowid = unsafe { ffi::sqlite3_column_int64(stmt, 0) };
+                    if self.vtab.is_without_rowid {
+                        // For WITHOUT ROWID tables, use a synthetic row counter
+                        // and try to get the first PK column value as rowid if it's an integer
+                        self.row_counter += 1;
+
+                        // Try to use the first PK column as rowid if it's an integer
+                        if !self.vtab.pk_columns.is_empty() {
+                            if let Some(pk_idx) = self.vtab.all_columns.iter().position(|(name, _)| {
+                                name == &self.vtab.pk_columns[0]
+                            }) {
+                                let col_type =
+                                    unsafe { ffi::sqlite3_column_type(stmt, pk_idx as c_int) };
+                                if col_type == ffi::SQLITE_INTEGER {
+                                    self.current_rowid =
+                                        unsafe { ffi::sqlite3_column_int64(stmt, pk_idx as c_int) };
+                                } else {
+                                    // Non-integer PK, use row counter
+                                    self.current_rowid = self.row_counter;
+                                }
+                            } else {
+                                self.current_rowid = self.row_counter;
+                            }
+                        } else {
+                            self.current_rowid = self.row_counter;
+                        }
+                    } else {
+                        // Regular table - read rowid (first column)
+                        self.current_rowid = unsafe { ffi::sqlite3_column_int64(stmt, 0) };
+                    }
                     self.eof = false;
                 }
                 ffi::SQLITE_DONE => {
@@ -215,9 +261,13 @@ unsafe impl VTabCursor for ZstdCursor<'_> {
             .stmt
             .ok_or_else(|| rusqlite::Error::ModuleError("No statement available".to_string()))?;
 
-        // col is 0-indexed in the virtual table
-        // but in our SELECT query, column 0 is rowid, so actual columns start at 1
-        let stmt_col = col + 1;
+        // For WITHOUT ROWID tables, columns start at index 0
+        // For regular tables, column 0 is rowid, so actual columns start at 1
+        let stmt_col = if self.vtab.is_without_rowid {
+            col
+        } else {
+            col + 1
+        };
 
         // Get column name to check if it needs decompression
         let (col_name, _) = &self.vtab.all_columns[col as usize];

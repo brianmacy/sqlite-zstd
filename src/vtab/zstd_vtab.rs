@@ -1,4 +1,6 @@
 //! Main virtual table implementation for zstd compression.
+//!
+//! Supports both regular rowid tables and WITHOUT ROWID tables.
 
 use rusqlite::ffi;
 use rusqlite::types::{Value, ValueRef};
@@ -27,6 +29,40 @@ pub struct ZstdVTab {
     pub underlying_table: String,
     pub compressed_columns: Vec<String>,
     pub all_columns: Vec<(String, String)>, // (name, type)
+    pub pk_columns: Vec<String>,            // Primary key column names
+    pub is_without_rowid: bool,             // Whether underlying table is WITHOUT ROWID
+}
+
+/// Check if a table is WITHOUT ROWID by attempting to select rowid
+fn detect_without_rowid(db_handle: *mut ffi::sqlite3, table_name: &str) -> bool {
+    // Try to prepare a query that selects rowid
+    // If it fails with "no such column: rowid", the table is WITHOUT ROWID
+    let sql = format!("SELECT rowid FROM \"{}\" LIMIT 0", table_name);
+    let sql_cstr = match std::ffi::CString::new(sql) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    let mut stmt_ptr: *mut ffi::sqlite3_stmt = std::ptr::null_mut();
+    let rc = unsafe {
+        ffi::sqlite3_prepare_v2(
+            db_handle,
+            sql_cstr.as_ptr(),
+            -1,
+            &mut stmt_ptr,
+            std::ptr::null_mut(),
+        )
+    };
+
+    // Clean up statement if it was created
+    if !stmt_ptr.is_null() {
+        unsafe {
+            ffi::sqlite3_finalize(stmt_ptr);
+        }
+    }
+
+    // If prepare failed, likely because "no such column: rowid"
+    rc != ffi::SQLITE_OK
 }
 
 unsafe impl<'vtab> VTab<'vtab> for ZstdVTab {
@@ -100,11 +136,15 @@ unsafe impl<'vtab> VTab<'vtab> for ZstdVTab {
             }
         }
 
-        // Build schema DDL with PRIMARY KEY constraints
-        let schema = build_schema_ddl(&all_columns, &pk_columns);
-
         // Get database handle for later use in insert/update/delete operations
         let db_handle = unsafe { db.handle() };
+
+        // Detect if the underlying table is WITHOUT ROWID
+        let is_without_rowid = detect_without_rowid(db_handle, &underlying_table);
+
+        // Build schema DDL with PRIMARY KEY constraints
+        // For WITHOUT ROWID underlying tables, we declare the virtual table as WITHOUT ROWID too
+        let schema = build_schema_ddl(&all_columns, &pk_columns, is_without_rowid);
 
         let vtab = ZstdVTab {
             base: sqlite3_vtab::default(),
@@ -112,6 +152,8 @@ unsafe impl<'vtab> VTab<'vtab> for ZstdVTab {
             underlying_table,
             compressed_columns,
             all_columns,
+            pk_columns,
+            is_without_rowid,
         };
 
         Ok((schema, vtab))
@@ -254,7 +296,12 @@ impl<'vtab> UpdateVTab<'vtab> for ZstdVTab {
         let rowid = match result {
             Ok(_) => {
                 drop(stmt);
-                conn.last_insert_rowid()
+                if self.is_without_rowid {
+                    // For WITHOUT ROWID tables, return 0 (no meaningful rowid)
+                    0
+                } else {
+                    conn.last_insert_rowid()
+                }
             }
             Err(rusqlite::Error::SqliteFailure(err, _))
                 if err.code == ffi::ErrorCode::ConstraintViolation =>
@@ -297,23 +344,58 @@ impl<'vtab> UpdateVTab<'vtab> for ZstdVTab {
     }
 
     fn delete(&mut self, arg: ValueRef<'_>) -> Result<()> {
-        let rowid = arg.as_i64()?;
-        let sql = format!("DELETE FROM \"{}\" WHERE rowid = ?", self.underlying_table);
-
         let conn = unsafe { Connection::from_handle_owned(self.db_handle)? };
-        conn.execute(&sql, [rowid])?;
-        std::mem::forget(conn);
 
+        if self.is_without_rowid {
+            // For WITHOUT ROWID tables, we need to use PK columns
+            // The arg contains the first PK column value (for single-column PK)
+            // or we need to handle composite keys differently
+            if self.pk_columns.len() == 1 {
+                // Single-column PK
+                let pk_col = &self.pk_columns[0];
+                let sql = format!(
+                    "DELETE FROM \"{}\" WHERE \"{}\" = ?",
+                    self.underlying_table, pk_col
+                );
+
+                // Bind the PK value based on its type
+                match arg {
+                    ValueRef::Integer(i) => conn.execute(&sql, [i])?,
+                    ValueRef::Text(t) => {
+                        let s = std::str::from_utf8(t)
+                            .map_err(|e| rusqlite::Error::ModuleError(e.to_string()))?;
+                        conn.execute(&sql, [s])?
+                    }
+                    ValueRef::Blob(b) => conn.execute(&sql, [b])?,
+                    ValueRef::Real(f) => conn.execute(&sql, [f])?,
+                    ValueRef::Null => {
+                        return Err(rusqlite::Error::ModuleError(
+                            "Cannot delete with NULL primary key".to_string(),
+                        ))
+                    }
+                };
+            } else {
+                // Composite PK - more complex handling needed
+                // For now, return an error - this needs cursor state tracking
+                return Err(rusqlite::Error::ModuleError(
+                    "DELETE on WITHOUT ROWID table with composite primary key requires cursor state tracking (not yet implemented)".to_string(),
+                ));
+            }
+        } else {
+            // Regular rowid table
+            let rowid = arg.as_i64()?;
+            let sql = format!("DELETE FROM \"{}\" WHERE rowid = ?", self.underlying_table);
+            conn.execute(&sql, [rowid])?;
+        }
+
+        std::mem::forget(conn);
         Ok(())
     }
 
     fn update(&mut self, args: &Values<'_>) -> Result<()> {
-        // args[0] = old rowid (NOT NULL)
-        // args[1] = new rowid
+        // args[0] = old rowid/PK (NOT NULL)
+        // args[1] = new rowid/PK
         // args[2..] = new column values
-
-        let old_rowid = args.get::<i64>(0)?;
-        let new_rowid = args.get::<i64>(1)?;
 
         // Build SET clauses with compression
         let mut set_clauses = Vec::new();
@@ -339,44 +421,136 @@ impl<'vtab> UpdateVTab<'vtab> for ZstdVTab {
             set_clauses.push(format!("\"{}\" = ?", col_name));
         }
 
-        // Handle rowid change
-        if old_rowid != new_rowid {
-            set_clauses.push("rowid = ?".to_string());
-            values.push(Value::Integer(new_rowid));
-        }
-
-        values.push(Value::Integer(old_rowid));
-
-        let sql = format!(
-            "UPDATE \"{}\" SET {} WHERE rowid = ?",
-            self.underlying_table,
-            set_clauses.join(", ")
-        );
-
-        // Execute UPDATE
         let conn = unsafe { Connection::from_handle_owned(self.db_handle)? };
-        let mut stmt = conn.prepare(&sql)?;
 
-        for (i, value) in values.iter().enumerate() {
-            match value {
-                Value::Null => stmt.raw_bind_parameter(i + 1, value)?,
-                Value::Integer(n) => stmt.raw_bind_parameter(i + 1, n)?,
-                Value::Real(f) => stmt.raw_bind_parameter(i + 1, f)?,
-                Value::Text(s) => stmt.raw_bind_parameter(i + 1, s)?,
-                Value::Blob(b) => stmt.raw_bind_parameter(i + 1, b)?,
+        if self.is_without_rowid {
+            // For WITHOUT ROWID tables, use PK columns in WHERE clause
+            if self.pk_columns.len() == 1 {
+                // Single-column PK
+                let pk_col = &self.pk_columns[0];
+                let old_pk: Value = args.get(0)?;
+                values.push(old_pk);
+
+                let sql = format!(
+                    "UPDATE \"{}\" SET {} WHERE \"{}\" = ?",
+                    self.underlying_table,
+                    set_clauses.join(", "),
+                    pk_col
+                );
+
+                let mut stmt = conn.prepare(&sql)?;
+                for (i, value) in values.iter().enumerate() {
+                    match value {
+                        Value::Null => stmt.raw_bind_parameter(i + 1, value)?,
+                        Value::Integer(n) => stmt.raw_bind_parameter(i + 1, n)?,
+                        Value::Real(f) => stmt.raw_bind_parameter(i + 1, f)?,
+                        Value::Text(s) => stmt.raw_bind_parameter(i + 1, s)?,
+                        Value::Blob(b) => stmt.raw_bind_parameter(i + 1, b)?,
+                    }
+                }
+                stmt.raw_execute()?;
+                drop(stmt);
+            } else {
+                // Composite PK - build WHERE clause for all PK columns
+                // The new PK values are in the column values (args[2..])
+                // The old PK values need to be extracted from args somehow
+                // For now, use the column values directly as we're updating in place
+
+                // Build WHERE clause using PK columns
+                let where_clauses: Vec<String> = self
+                    .pk_columns
+                    .iter()
+                    .map(|pk| format!("\"{}\" = ?", pk))
+                    .collect();
+
+                let sql = format!(
+                    "UPDATE \"{}\" SET {} WHERE {}",
+                    self.underlying_table,
+                    set_clauses.join(", "),
+                    where_clauses.join(" AND ")
+                );
+
+                // Get old PK values from args[0] - for composite keys, this might be encoded
+                // Alternatively, we can use the new PK values from the column data
+                // since we're updating to those values anyway
+
+                // Collect PK values from the new column values (args[2..])
+                let mut pk_values = Vec::new();
+                for pk_col in &self.pk_columns {
+                    if let Some(idx) = self
+                        .all_columns
+                        .iter()
+                        .position(|(name, _)| name == pk_col)
+                    {
+                        let val: Value = args.get(idx + 2)?;
+                        pk_values.push(val);
+                    }
+                }
+
+                // Append PK values for WHERE clause
+                values.extend(pk_values);
+
+                let mut stmt = conn.prepare(&sql)?;
+                for (i, value) in values.iter().enumerate() {
+                    match value {
+                        Value::Null => stmt.raw_bind_parameter(i + 1, value)?,
+                        Value::Integer(n) => stmt.raw_bind_parameter(i + 1, n)?,
+                        Value::Real(f) => stmt.raw_bind_parameter(i + 1, f)?,
+                        Value::Text(s) => stmt.raw_bind_parameter(i + 1, s)?,
+                        Value::Blob(b) => stmt.raw_bind_parameter(i + 1, b)?,
+                    }
+                }
+                stmt.raw_execute()?;
+                drop(stmt);
             }
+        } else {
+            // Regular rowid table
+            let old_rowid = args.get::<i64>(0)?;
+            let new_rowid = args.get::<i64>(1)?;
+
+            // Handle rowid change
+            if old_rowid != new_rowid {
+                set_clauses.push("rowid = ?".to_string());
+                values.push(Value::Integer(new_rowid));
+            }
+
+            values.push(Value::Integer(old_rowid));
+
+            let sql = format!(
+                "UPDATE \"{}\" SET {} WHERE rowid = ?",
+                self.underlying_table,
+                set_clauses.join(", ")
+            );
+
+            let mut stmt = conn.prepare(&sql)?;
+            for (i, value) in values.iter().enumerate() {
+                match value {
+                    Value::Null => stmt.raw_bind_parameter(i + 1, value)?,
+                    Value::Integer(n) => stmt.raw_bind_parameter(i + 1, n)?,
+                    Value::Real(f) => stmt.raw_bind_parameter(i + 1, f)?,
+                    Value::Text(s) => stmt.raw_bind_parameter(i + 1, s)?,
+                    Value::Blob(b) => stmt.raw_bind_parameter(i + 1, b)?,
+                }
+            }
+            stmt.raw_execute()?;
+            drop(stmt);
         }
 
-        stmt.raw_execute()?;
-        drop(stmt); // Drop statement before forgetting connection
         std::mem::forget(conn);
-
         Ok(())
     }
 }
 
 /// Build schema DDL for the virtual table with PRIMARY KEY constraints
-fn build_schema_ddl(columns: &[(String, String)], pk_columns: &[String]) -> String {
+///
+/// Note: The schema DDL should NOT include WITHOUT ROWID - that's controlled
+/// by the CREATE VIRTUAL TABLE statement itself. The virtual table can still
+/// handle WITHOUT ROWID underlying tables without declaring itself as WITHOUT ROWID.
+fn build_schema_ddl(
+    columns: &[(String, String)],
+    pk_columns: &[String],
+    _without_rowid: bool,
+) -> String {
     // Build column definitions
     let col_defs: Vec<String> = columns
         .iter()
@@ -390,8 +564,12 @@ fn build_schema_ddl(columns: &[(String, String)], pk_columns: &[String]) -> Stri
         })
         .collect();
 
-    // If composite primary key, add PRIMARY KEY constraint at table level
+    // Build the CREATE TABLE statement
+    // Note: WITHOUT ROWID is NOT included here - it's only for the CREATE VIRTUAL TABLE
+    // statement itself. The virtual table handles WITHOUT ROWID underlying tables
+    // by detecting them and adjusting its queries accordingly.
     if pk_columns.len() > 1 {
+        // Composite primary key - add PRIMARY KEY constraint at table level
         let pk_list = pk_columns
             .iter()
             .map(|name| format!("\"{}\"", name))

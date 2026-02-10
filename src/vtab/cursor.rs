@@ -89,7 +89,7 @@ unsafe impl VTabCursor for ZstdCursor<'_> {
         &mut self,
         idx_num: c_int,
         _idx_str: Option<&str>,
-        args: &rusqlite::vtab::Values<'_>,
+        args: &rusqlite::vtab::Filters<'_>,
     ) -> Result<()> {
         // Clean up any existing statement
         if let Some(stmt) = self.stmt.take() {

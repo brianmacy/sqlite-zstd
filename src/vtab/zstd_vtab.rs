@@ -8,7 +8,8 @@ use std::sync::Mutex;
 use rusqlite::ffi;
 use rusqlite::types::{Value, ValueRef};
 use rusqlite::vtab::{
-    CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection, Values, sqlite3_vtab, update_module,
+    CreateVTab, IndexInfo, Inserts, UpdateVTab, Updates, VTab, VTabConnection, sqlite3_vtab,
+    update_module,
 };
 use rusqlite::{Connection, Result};
 
@@ -229,7 +230,7 @@ impl<'vtab> CreateVTab<'vtab> for ZstdVTab {
 }
 
 impl<'vtab> UpdateVTab<'vtab> for ZstdVTab {
-    fn insert(&mut self, args: &Values<'_>) -> Result<i64> {
+    fn insert(&mut self, args: &Inserts<'_>) -> Result<i64> {
         // args[0] = old rowid (NULL for INSERT)
         // args[1] = new rowid (NULL = auto-assign, otherwise explicit)
         // args[2..] = column values
@@ -433,7 +434,7 @@ impl<'vtab> UpdateVTab<'vtab> for ZstdVTab {
         Ok(())
     }
 
-    fn update(&mut self, args: &Values<'_>) -> Result<()> {
+    fn update(&mut self, args: &Updates<'_>) -> Result<()> {
         // args[0] = old rowid/PK (NOT NULL)
         // args[1] = new rowid/PK
         // args[2..] = new column values

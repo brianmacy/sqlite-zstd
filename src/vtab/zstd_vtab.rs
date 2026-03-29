@@ -8,7 +8,8 @@ use std::sync::Mutex;
 use rusqlite::ffi;
 use rusqlite::types::{Value, ValueRef};
 use rusqlite::vtab::{
-    CreateVTab, IndexInfo, Inserts, UpdateVTab, Updates, VTab, VTabConnection, sqlite3_vtab, update_module,
+    CreateVTab, IndexInfo, Inserts, UpdateVTab, Updates, VTab, VTabConnection, sqlite3_vtab,
+    update_module,
 };
 use rusqlite::{Connection, Result};
 

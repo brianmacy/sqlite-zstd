@@ -16,7 +16,7 @@ loadable_extension = ["rusqlite/loadable_extension"]
 [dependencies]
 zstd = "0.13"
 # Using same forked rusqlite as sqlite-vec-hnsw for consistent SQLite shared library handling
-rusqlite = { git = "https://github.com/brianmacy/rusqlite", branch = "custom-vtab-features", features = ["bundled", "functions", "vtab"] }
+rusqlite = { git = "https://github.com/brianmacy/rusqlite", branch = "custom-vtab-features", features = ["functions", "vtab"] }
 
 [dev-dependencies]
 tempfile = "3"

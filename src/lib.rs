@@ -884,19 +884,15 @@ pub unsafe extern "C" fn sqlite3_extension_init(
         return ffi::SQLITE_ERROR;
     }
 
-    // Wrap the raw pointer in a Connection
+    // Wrap the raw pointer in a Connection (owned=false, won't call sqlite3_close on drop)
     let conn = match unsafe { Connection::from_handle(db) } {
         Ok(c) => c,
         Err(_) => return ffi::SQLITE_ERROR,
     };
 
-    // Register our functions
+    // Register our functions — conn drops naturally without closing the handle
     match register_functions(&conn) {
-        Ok(_) => {
-            // Don't drop the connection - SQLite owns it
-            std::mem::forget(conn);
-            ffi::SQLITE_OK
-        }
+        Ok(_) => ffi::SQLITE_OK,
         Err(_) => ffi::SQLITE_ERROR,
     }
 }

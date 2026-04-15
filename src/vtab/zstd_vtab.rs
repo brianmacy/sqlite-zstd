@@ -285,7 +285,8 @@ impl<'vtab> UpdateVTab<'vtab> for ZstdVTab {
         };
 
         // Execute INSERT and handle constraint violations based on conflict mode
-        let conn = unsafe { Connection::from_handle_owned(self.db_handle)? };
+        // Use from_handle (owned=false) so dropping conn won't call sqlite3_close
+        let conn = unsafe { Connection::from_handle(self.db_handle)? };
         let mut stmt = conn.prepare(&sql)?;
 
         // Bind parameters
@@ -306,7 +307,6 @@ impl<'vtab> UpdateVTab<'vtab> for ZstdVTab {
             Ok(_) => {
                 drop(stmt);
                 if self.is_without_rowid {
-                    // For WITHOUT ROWID tables, return 0 (no meaningful rowid)
                     0
                 } else {
                     conn.last_insert_rowid()
@@ -315,45 +315,28 @@ impl<'vtab> UpdateVTab<'vtab> for ZstdVTab {
             Err(rusqlite::Error::SqliteFailure(err, _))
                 if err.code == ffi::ErrorCode::ConstraintViolation =>
             {
-                // Constraint violation occurred
                 match conflict_mode {
                     ConflictMode::Ignore => {
-                        // For IGNORE/DO NOTHING: Return success with rowid 0
-                        // This signals success without inserting
-                        drop(stmt);
-                        std::mem::forget(conn);
                         return Ok(0);
                     }
                     ConflictMode::Fail | ConflictMode::Abort | ConflictMode::Rollback => {
-                        // Propagate the constraint error
-                        drop(stmt);
-                        std::mem::forget(conn);
                         return Err(rusqlite::Error::SqliteFailure(err, None));
                     }
                     ConflictMode::Replace => {
-                        // Should not reach here - REPLACE uses INSERT OR REPLACE
-                        drop(stmt);
-                        std::mem::forget(conn);
                         return Err(rusqlite::Error::SqliteFailure(err, None));
                     }
                 }
             }
             Err(e) => {
-                // Other errors
-                drop(stmt);
-                std::mem::forget(conn);
                 return Err(e);
             }
         };
-
-        // Don't drop the connection - SQLite owns it
-        std::mem::forget(conn);
 
         Ok(rowid)
     }
 
     fn delete(&mut self, arg: ValueRef<'_>) -> Result<()> {
-        let conn = unsafe { Connection::from_handle_owned(self.db_handle)? };
+        let conn = unsafe { Connection::from_handle(self.db_handle)? };
 
         if self.is_without_rowid {
             // For WITHOUT ROWID tables, we need to use PK columns
@@ -388,7 +371,6 @@ impl<'vtab> UpdateVTab<'vtab> for ZstdVTab {
                 stmt.raw_execute()?;
                 drop(stmt);
                 drop(cache);
-                std::mem::forget(conn);
                 return Ok(());
             }
 
@@ -430,7 +412,6 @@ impl<'vtab> UpdateVTab<'vtab> for ZstdVTab {
             conn.execute(&sql, [rowid])?;
         }
 
-        std::mem::forget(conn);
         Ok(())
     }
 
@@ -463,7 +444,7 @@ impl<'vtab> UpdateVTab<'vtab> for ZstdVTab {
             set_clauses.push(format!("\"{}\" = ?", col_name));
         }
 
-        let conn = unsafe { Connection::from_handle_owned(self.db_handle)? };
+        let conn = unsafe { Connection::from_handle(self.db_handle)? };
 
         if self.is_without_rowid {
             // For WITHOUT ROWID tables, use PK columns in WHERE clause
@@ -592,7 +573,6 @@ impl<'vtab> UpdateVTab<'vtab> for ZstdVTab {
             drop(stmt);
         }
 
-        std::mem::forget(conn);
         Ok(())
     }
 }

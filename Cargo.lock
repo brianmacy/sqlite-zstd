@@ -323,7 +323,7 @@ checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
 [[package]]
 name = "libsqlite3-sys"
 version = "0.36.0"
-source = "git+https://github.com/brianmacy/rusqlite?branch=custom-vtab-features#458d948922f3ac66c8bc5b9cb4d6be11f44668c6"
+source = "git+https://github.com/brianmacy/rusqlite?branch=custom-vtab-features#dfaf5c7383f98642b215011b3bf33409b4255c74"
 dependencies = [
  "pkg-config",
  "prettyplease",
@@ -505,7 +505,7 @@ dependencies = [
 [[package]]
 name = "rusqlite"
 version = "0.38.0"
-source = "git+https://github.com/brianmacy/rusqlite?branch=custom-vtab-features#458d948922f3ac66c8bc5b9cb4d6be11f44668c6"
+source = "git+https://github.com/brianmacy/rusqlite?branch=custom-vtab-features#dfaf5c7383f98642b215011b3bf33409b4255c74"
 dependencies = [
  "bitflags",
  "fallible-iterator",

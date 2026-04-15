@@ -163,7 +163,7 @@ version = "0.2.180"
 criteria = "safe-to-deploy"
 
 [[exemptions.libsqlite3-sys]]
-version = "0.36.0@git:458d948922f3ac66c8bc5b9cb4d6be11f44668c6"
+version = "0.36.0@git:dfaf5c7383f98642b215011b3bf33409b4255c74"
 criteria = "safe-to-deploy"
 
 [[exemptions.linux-raw-sys]]
@@ -247,7 +247,7 @@ version = "0.1.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.rusqlite]]
-version = "0.38.0@git:458d948922f3ac66c8bc5b9cb4d6be11f44668c6"
+version = "0.38.0@git:dfaf5c7383f98642b215011b3bf33409b4255c74"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustix]]

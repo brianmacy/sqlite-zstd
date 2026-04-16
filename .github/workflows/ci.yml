@@ -44,11 +44,31 @@ jobs:
           path: target
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Install SQLite (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $sqliteUrl = "https://www.sqlite.org/2025/sqlite-dll-win-x64-3520000.zip"
+          $amalgUrl = "https://www.sqlite.org/2025/sqlite-amalgamation-3520000.zip"
+          Invoke-WebRequest -Uri $sqliteUrl -OutFile sqlite-dll.zip
+          Invoke-WebRequest -Uri $amalgUrl -OutFile sqlite-amalg.zip
+          Expand-Archive sqlite-dll.zip -DestinationPath sqlite
+          Expand-Archive sqlite-amalg.zip -DestinationPath sqlite-amalg
+          # Generate import lib from DLL
+          cd sqlite
+          lib /def:sqlite3.def /out:sqlite3.lib /machine:x64
+          cp ../sqlite-amalg/sqlite-amalgamation-3520000/sqlite3.h .
+          echo "SQLITE3_LIB_DIR=$PWD" >> $env:GITHUB_ENV
+          echo "$PWD" >> $env:GITHUB_PATH
+
+      - name: Set SQLite library path (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          echo "SQLITE3_LIB_DIR=${{ github.workspace }}/sqlite" >> $env:GITHUB_ENV
+
       - name: Run tests
         run: cargo test
-
-      # Note: loadable_extension feature is only for building the extension,
-      # not for running tests. Tests use the bundled SQLite.
 
   lint:
     name: Linting

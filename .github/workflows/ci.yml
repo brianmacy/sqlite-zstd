@@ -56,7 +56,7 @@ jobs:
           tar -xf sqlite-amalg.zip -C sqlite-amalg
           copy sqlite-amalg\sqlite-amalgamation-3530000\sqlite3.h sqlite\
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" && cd sqlite && lib /def:sqlite3.def /out:sqlite3.lib /machine:x64
-          echo SQLITE3_LIB_DIR=%CD%\sqlite>> %GITHUB_ENV%
+          echo SQLITE3_LIB_DIR=%CD%>> %GITHUB_ENV%
 
       - name: Run tests
         run: cargo test

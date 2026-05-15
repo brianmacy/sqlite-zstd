@@ -159,7 +159,7 @@ version = "0.3.85"
 criteria = "safe-to-deploy"
 
 [[exemptions.libc]]
-version = "0.2.180"
+version = "0.2.186"
 criteria = "safe-to-deploy"
 
 [[exemptions.libsqlite3-sys]]
@@ -167,7 +167,7 @@ version = "0.36.0@git:18ce4dbced5f56faf4e3b5368f285253e795232c"
 criteria = "safe-to-deploy"
 
 [[exemptions.linux-raw-sys]]
-version = "0.11.0"
+version = "0.12.1"
 criteria = "safe-to-run"
 
 [[exemptions.memchr]]
@@ -251,7 +251,7 @@ version = "0.38.0@git:18ce4dbced5f56faf4e3b5368f285253e795232c"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustix]]
-version = "1.1.3"
+version = "1.1.4"
 criteria = "safe-to-run"
 
 [[exemptions.rustversion]]
@@ -295,7 +295,7 @@ version = "2.0.114"
 criteria = "safe-to-deploy"
 
 [[exemptions.tempfile]]
-version = "3.24.0"
+version = "3.27.0"
 criteria = "safe-to-run"
 
 [[exemptions.thiserror]]

@@ -2,6 +2,7 @@
 name = "sqlite-zstd"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 license = "Apache-2.0"
 description = "SQLite extension for seamless TEXT field compression using Zstandard"
 repository = "https://github.com/brianmacy/sqlite-zstd"

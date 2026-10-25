@@ -82,7 +82,7 @@ notes = "rust-lang-owner (crates.io id 55123), the Rust project's publishing acc
 
 [[trusted.js-sys]]
 criteria = "safe-to-deploy"
-user-id = 1
+user-id = 1 # Alex Crichton (alexcrichton)
 start = "2019-03-04"
 end = "2027-10-25"
 notes = "Alex Crichton (alexcrichton, crates.io id 1): publisher is in the [[trusted]] sets of the imported mozilla, bytecode-alliance, isrg and ariel-os audit sets (checked 2026-10-25)."
@@ -215,35 +215,35 @@ notes = "Andrew Gallant (BurntSushi, crates.io id 189): publisher is in the [[tr
 
 [[trusted.wasm-bindgen]]
 criteria = "safe-to-deploy"
-user-id = 1
+user-id = 1 # Alex Crichton (alexcrichton)
 start = "2019-03-04"
 end = "2027-10-25"
 notes = "Alex Crichton (alexcrichton, crates.io id 1): publisher is in the [[trusted]] sets of the imported mozilla, bytecode-alliance, isrg and ariel-os audit sets (checked 2026-10-25)."
 
 [[trusted.wasm-bindgen-macro]]
 criteria = "safe-to-deploy"
-user-id = 1
+user-id = 1 # Alex Crichton (alexcrichton)
 start = "2019-03-04"
 end = "2027-10-25"
 notes = "Alex Crichton (alexcrichton, crates.io id 1): publisher is in the [[trusted]] sets of the imported mozilla, bytecode-alliance, isrg and ariel-os audit sets (checked 2026-10-25)."
 
 [[trusted.wasm-bindgen-macro-support]]
 criteria = "safe-to-deploy"
-user-id = 1
+user-id = 1 # Alex Crichton (alexcrichton)
 start = "2019-03-04"
 end = "2027-10-25"
 notes = "Alex Crichton (alexcrichton, crates.io id 1): publisher is in the [[trusted]] sets of the imported mozilla, bytecode-alliance, isrg and ariel-os audit sets (checked 2026-10-25)."
 
 [[trusted.wasm-bindgen-shared]]
 criteria = "safe-to-deploy"
-user-id = 1
+user-id = 1 # Alex Crichton (alexcrichton)
 start = "2019-03-04"
 end = "2027-10-25"
 notes = "Alex Crichton (alexcrichton, crates.io id 1): publisher is in the [[trusted]] sets of the imported mozilla, bytecode-alliance, isrg and ariel-os audit sets (checked 2026-10-25)."
 
 [[trusted.web-sys]]
 criteria = "safe-to-deploy"
-user-id = 1
+user-id = 1 # Alex Crichton (alexcrichton)
 start = "2019-03-04"
 end = "2027-10-25"
 notes = "Alex Crichton (alexcrichton, crates.io id 1): publisher is in the [[trusted]] sets of the imported mozilla, bytecode-alliance, isrg and ariel-os audit sets (checked 2026-10-25)."
